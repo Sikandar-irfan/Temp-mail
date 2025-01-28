@@ -139,35 +139,6 @@ Like this project? Please give it a star ⭐ to show your support!
 Sikandar Irfan
 - GitHub: [@Sikandar-irfan](https://github.com/Sikandar-irfan)
 
-## 🔧 Development
-
-### Running Tests
-```bash
-# Install development dependencies
-pip install -r requirements.txt
-
-# Run tests
-pytest tests/
-
-# Run tests with coverage
-pytest tests/ --cov=.
-```
-
-### Code Style
-We use:
-- Black for code formatting
-- isort for import sorting
-- flake8 for linting
-
-```bash
-# Format code
-black .
-isort .
-
-# Check style
-flake8
-```
-
 ---
 
 <div align="center">
