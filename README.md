@@ -16,6 +16,8 @@
 [Contributing](#-contributing) • 
 [License](#-license)
 
+<img src="docs/images/demo.png" alt="TempMail Manager Demo" width="800">
+
 </div>
 
 ## ✨ Features
@@ -66,6 +68,12 @@ Start the application:
 ```bash
 python cli.py
 ```
+
+### Interactive Menu
+
+<div align="center">
+<img src="docs/images/menu.png" alt="TempMail Manager Menu" width="600">
+</div>
 
 ### Available Commands
 
