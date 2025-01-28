@@ -9,7 +9,12 @@
 
 *A powerful and secure temporary email solution for your privacy needs*
 
-[Features](#features) • [Installation](#installation) • [Usage](#usage) • [Contributing](#contributing) • [License](#license)
+[Features](#-features) • 
+[Installation](#-quick-start) • 
+[Usage](#-usage) • 
+[Examples](#-code-examples) • 
+[Contributing](#-contributing) • 
+[License](#-license)
 
 </div>
 
@@ -50,14 +55,9 @@ git clone https://github.com/Sikandar-irfan/Temp-mail.git
 # Navigate to project directory
 cd Temp-mail
 
-# Create virtual environment
-python -m venv venv
-
-# Activate virtual environment
-source venv/bin/activate  # On Windows: venv\Scripts\activate
-
-# Install dependencies
-pip install -r requirements.txt
+# Run setup script (this will create virtual environment and install dependencies)
+chmod +x setup.sh
+./setup.sh
 ```
 
 ## 💻 Usage
@@ -138,6 +138,35 @@ Like this project? Please give it a star ⭐ to show your support!
 
 Sikandar Irfan
 - GitHub: [@Sikandar-irfan](https://github.com/Sikandar-irfan)
+
+## 🔧 Development
+
+### Running Tests
+```bash
+# Install development dependencies
+pip install -r requirements.txt
+
+# Run tests
+pytest tests/
+
+# Run tests with coverage
+pytest tests/ --cov=.
+```
+
+### Code Style
+We use:
+- Black for code formatting
+- isort for import sorting
+- flake8 for linting
+
+```bash
+# Format code
+black .
+isort .
+
+# Check style
+flake8
+```
 
 ---
 
