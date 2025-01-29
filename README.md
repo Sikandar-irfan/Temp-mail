@@ -25,7 +25,7 @@
 🔒 **Privacy First**
 - Generate disposable email addresses instantly
 - Protect your real email from spam and tracking
-- Auto-delete emails after use
+- Delete multiple emails after use
 
 📱 **Smart Monitoring**
 - Real-time email notifications
