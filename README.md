@@ -111,7 +111,7 @@ manager.monitor_email(email, callback=on_message)
 
 TempMail Manager allows you to forward emails to both temporary and external email addresses. Here's how to set it up:
 
-### Setting up Gmail SMTP (Recommended)
+### Setting up Gmail SMTP (RecommendedIf you are sending to external valid gmails)
 
 #### Step 1: Enable 2-Step Verification (Required)
 
