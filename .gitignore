@@ -37,3 +37,11 @@ pip-selfcheck.json
 *.log
 tempmail_export_*.json
 chikki_sudo
+
+# Environment variables
+.env
+.env.*
+
+# Application data
+data/
+logs/

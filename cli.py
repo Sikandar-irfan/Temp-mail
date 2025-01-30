@@ -17,6 +17,7 @@ from typing import Dict, List, Optional
 import requests
 import json
 from logging.handlers import RotatingFileHandler
+from concurrent.futures import ThreadPoolExecutor, TimeoutError
 
 from temp_mail_manager import (
     TempMailManager,
@@ -563,81 +564,81 @@ def generate_test_data():
 def forward_email_menu():
     """Handle email forwarding menu with input validation"""
     try:
-        # Get list of active emails
-        emails = list_emails(active_only=True)
-        if not emails:
-            console.print("[yellow]No active emails found. Generate at least two emails first.[/]")
+        # Get active emails
+        active_emails = active_manager.get_active_emails()
+        if not active_emails:
+            console.print("No active emails found. Please generate an email first.")
             return
             
-        if len(emails) < 2:
-            console.print("[yellow]You need at least two active emails to forward messages.[/]")
-            return
-            
-        # Select source email
-        from_email = questionary.select(
+        # Get source email
+        source_email = questionary.select(
             "Select source email:",
-            choices=[e['email'] for e in emails]
+            choices=active_emails
         ).ask()
         
-        if not from_email:
+        if not source_email:
+            return
+        
+        # Get message to forward
+        messages = active_manager.get_messages(source_email)
+        if not messages:
+            console.print("No messages found in source email")
             return
             
-        # Get messages for source email
-        try:
-            messages = active_manager.get_messages(from_email)
-            if not messages:
-                console.print("[yellow]No messages found in source email.[/]")
-                return
-                
-            # Select message to forward
-            message_choices = [
-                f"{msg.get('id', 'N/A')} - {msg.get('subject', 'No Subject')}"
-                for msg in messages
+        message_choices = [
+            f"{msg.get('id', 'unknown')} - {msg.get('subject', 'No Subject')}"
+            for msg in messages
+        ]
+        
+        message_id = questionary.select(
+            "Select message to forward:",
+            choices=message_choices
+        ).ask()
+        
+        if not message_id:
+            return
+            
+        message_id = message_id.split(' - ')[0]
+        
+        # Ask for target email type
+        target_type = questionary.select(
+            "Select target email type:",
+            choices=[
+                "Temporary Email",
+                "External Email"
             ]
-            
-            message_choice = questionary.select(
-                "Select message to forward:",
-                choices=message_choices
-            ).ask()
-            
-            if not message_choice:
-                return
-                
-            message_id = message_choice.split(' - ')[0]
-            
-            # Select target email
-            to_email = questionary.select(
+        ).ask()
+        
+        if target_type == "Temporary Email":
+            # Get target temp email from active emails
+            target_email = questionary.select(
                 "Select target email:",
-                choices=[e['email'] for e in emails if e['email'] != from_email]
+                choices=active_emails
             ).ask()
-            
-            if not to_email:
-                return
-                
-            # Confirm action
-            if not Confirm.ask(f"Forward message from {from_email} to {to_email}?"):
-                return
-                
-            # Forward message
-            try:
-                with console.status("[bold blue]Forwarding message...[/]"):
-                    success = active_manager.forward_email(from_email, to_email, message_id)
-                    
-                if success:
-                    console.print("[green]Message forwarded successfully![/]")
-                else:
-                    console.print("[red]Failed to forward message.[/]")
-                    
-            except Exception as e:
-                console.print(f"[red]Error forwarding message: {str(e)}[/]")
-                
-        except Exception as e:
-            console.print(f"[red]Error getting messages: {str(e)}[/]")
+        else:
+            # Get external email address
+            target_email = questionary.text(
+                "Enter target email address:",
+                validate=lambda text: '@' in text and '.' in text.split('@')[1]
+            ).ask()
+        
+        if not target_email:
             return
+            
+        # Confirm forwarding
+        if not questionary.confirm(
+            f"Forward message from {source_email} to {target_email}?"
+        ).ask():
+            return
+            
+        # Forward the message
+        if active_manager.forward_email(source_email, target_email, message_id):
+            console.print("[green]Message forwarded successfully![/green]")
+        else:
+            console.print("[red]Failed to forward message. Check logs for details.[/red]")
             
     except Exception as e:
-        logging.getLogger('temp_mail_cli').error(f"Error in forward_email_menu: {str(e)}")
-        console.print("[red]An error occurred in the forwarding menu.[/]")
+        console.print(f"[red]Error forwarding email: {str(e)}[/red]")
 
 def delete_email():
     """Delete one or more emails with proper cleanup"""
@@ -692,22 +693,17 @@ def delete_email():
         # Perform deletion with cleanup
         if emails_to_delete:
             try:
-                with console.status("[bold blue]Deleting emails...[/]"):
+                with console.status("[bold blue]Deleting emails...[/]") as status:
                     for email in emails_to_delete:
                         # Stop monitoring if active
                         stop_monitoring(email)
                         
-                        # Delete from provider
-                        provider = active_manager.get_provider_for_email(email)
-                        if provider:
-                            try:
-                                provider.cleanup(email)
-                            except Exception as e:
-                                logging.getLogger('temp_mail_cli').warning(f"Provider cleanup failed for {email}: {str(e)}")
-                                
                         # Delete from manager
-                        active_manager.delete_email(email)
-                        
+                        if active_manager.delete_email(email):
+                            status.update(f"[bold blue]Deleted {email}[/]")
+                        else:
+                            status.update(f"[yellow]Failed to delete {email}[/]")
+                            
                 console.print(f"[green]Successfully deleted {len(emails_to_delete)} email(s)![/]")
                 
             except Exception as e:
@@ -716,6 +712,7 @@ def delete_email():
     except Exception as e:
         logging.getLogger('temp_mail_cli').error(f"Error in delete_email: {str(e)}")
         console.print("[red]An error occurred while deleting emails.[/]")
+
 
 def handle_menu_option(option: str):
     """Handle menu option selection"""

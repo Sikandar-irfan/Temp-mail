@@ -15,6 +15,10 @@ from datetime import datetime
 from hashlib import md5
 from threading import Lock
 from logging.handlers import RotatingFileHandler
+from dotenv import load_dotenv
+
+# Load environment variables from .env file
+load_dotenv()
 
 try:
     import aiosmtplib
@@ -894,103 +898,219 @@ class TempMailManager:
 
     def forward_email(self, from_email: str, to_email: str, message_id: str) -> bool:
         """
-        Forward an email from one temp mail to another using provider's native capabilities
-        or fallback to manual forwarding if not supported.
+        Forward an email from one address to another
         
         Args:
             from_email (str): Source email address
-            to_email (str): Destination email address
+            to_email (str): Target email address (can be any valid email)
             message_id (str): ID of the message to forward
             
         Returns:
-            bool: True if forwarding successful, False otherwise
+            bool: True if successful, False otherwise
         """
         try:
-            # Get providers
-            from_provider = self.get_provider_for_email(from_email)
-            to_provider = self.get_provider_for_email(to_email)
+            self.logger.info(f"Starting to forward message {message_id} from {from_email} to {to_email}")
             
-            if not from_provider or not to_provider:
-                raise EmailProviderError("Provider not found for one or both emails")
-
-            # Get original message
-            message = from_provider.get_message(from_email, message_id)
-            if not message:
-                raise EmailProviderError(f"Message {message_id} not found")
-
-            # Create forwarded message content
-            forward_content = self._create_forward_body(message, from_email)
-
-            # Try provider's native forwarding first
-            if hasattr(to_provider, 'forward_message'):
-                success = to_provider.forward_message(to_email, forward_content)
-                if success:
-                    self.logger.info(f"Successfully forwarded message using provider's native capability")
-                    return True
-
-            # Fallback to manual forwarding
-            try:
-                # Create new message in destination inbox
-                success = self._manual_forward(to_email, forward_content)
-                if success:
-                    self.logger.info(f"Successfully forwarded message using manual forwarding")
-                    return True
-                else:
-                    raise EmailProviderError("Failed to forward message")
-
-            except Exception as e:
-                self.logger.error(f"Error in manual forwarding: {str(e)}")
-                raise
-
-        except Exception as e:
-            self.logger.error(f"Error forwarding email: {str(e)}")
-            raise
-
-    def _create_forward_body(self, message: Dict, from_email: str) -> Dict:
-        """Create the forwarded message content with proper formatting"""
-        try:
-            # Get original message fields
-            subject = message.get('subject', 'No Subject')
-            body = message.get('body', '')
-            sender = message.get('from', 'Unknown')
-            date = message.get('date', 'Unknown')
+            # Validate email addresses
+            if not self.validate_email(from_email) or not self.validate_email(to_email):
+                self.logger.error("Invalid email address format")
+                return False
             
-            # Create forwarded message content
-            forward_content = {
-                'subject': f"Fwd: {subject}",
-                'body': f"\n\n---------- Forwarded message ----------\n"
-                       f"From: {sender}\n"
-                       f"Date: {date}\n"
-                       f"Subject: {subject}\n"
-                       f"To: {from_email}\n\n"
-                       f"{body}",
-                'from': from_email,
-                'html': message.get('html', '')
-            }
-            
-            return forward_content
-            
-        except Exception as e:
-            self.logger.error(f"Error creating forward body: {str(e)}")
-            raise
-
-    def _manual_forward(self, to_email: str, forward_content: Dict) -> bool:
-        """Manually forward a message by creating a new message in the destination inbox"""
-        try:
-            # Get provider for destination email
-            to_provider = self.get_provider_for_email(to_email)
-            if not to_provider:
-                raise EmailProviderError("Provider not found for destination email")
-
-            # Send message using provider's send_message method
-            success = to_provider.send_message(forward_content)
-            if not success:
-                raise EmailProviderError("Failed to send forwarded message")
+            # Get provider for source email
+            provider = self.get_provider_for_email(from_email)
+            if not provider:
+                self.logger.error(f"No provider found for {from_email}")
+                return False
                 
+            # Get message to forward
+            self.logger.info(f"Fetching message {message_id} from {from_email}")
+            message = provider.get_message(from_email, message_id)
+            if not message:
+                self.logger.error(f"Message {message_id} not found")
+                return False
+                
+            self.logger.info(f"Message retrieved successfully: {message.get('subject', 'No Subject')}")
+                
+            # Check if target is a temporary email
+            target_provider = self.get_provider_for_email(to_email)
+            if target_provider:
+                self.logger.info(f"Using provider {target_provider.__class__.__name__} for forwarding")
+                # Use provider's forward_message for temp emails
+                message['forwarded_from'] = from_email
+                success = target_provider.forward_message(to_email, message)
+                if success:
+                    self.logger.info("Message forwarded successfully using provider")
+                else:
+                    self.logger.error("Provider failed to forward message")
+                return success
+            else:
+                self.logger.info(f"Forwarding to external email {to_email} via SMTP")
+                # For external emails, use SMTP
+                success = self._forward_to_external_email(from_email, to_email, message)
+                if success:
+                    self.logger.info("Message forwarded successfully via SMTP")
+                else:
+                    self.logger.error("SMTP forwarding failed")
+                return success
+                
+        except Exception as e:
+            self.logger.error(f"Error forwarding email: {str(e)}", exc_info=True)
+            return False
+            
+    def _forward_to_external_email(self, from_email: str, to_email: str, message: Dict) -> bool:
+        """Forward a message to an external email address using SMTP"""
+        try:
+            import smtplib
+            from email.mime.text import MIMEText
+            from email.mime.multipart import MIMEMultipart
+            from email.mime.application import MIMEApplication
+            from email.utils import formatdate
+            from bs4 import BeautifulSoup
+            import base64
+            
+            # Get SMTP settings
+            smtp_host = os.getenv('SMTP_HOST')
+            smtp_port = int(os.getenv('SMTP_PORT', '587'))
+            smtp_user = os.getenv('SMTP_USER')
+            smtp_pass = os.getenv('SMTP_PASS')
+            
+            if not all([smtp_host, smtp_port, smtp_user, smtp_pass]):
+                self.logger.error("Missing SMTP settings")
+                return False
+            
+            # Create message
+            msg = MIMEMultipart('mixed')
+            msg['Subject'] = f"Fwd: {message.get('subject', 'No Subject')}"
+            msg['From'] = smtp_user
+            msg['To'] = to_email
+            msg['Date'] = formatdate(localtime=True)
+            
+            # Create the body as a multipart alternative (plain text + HTML)
+            body = MIMEMultipart('alternative')
+            
+            # Create forwarding header
+            forward_header = (
+                "\n\n---------- Forwarded message ----------\n"
+                f"From: {message.get('from', 'Unknown')}\n"
+                f"Date: {self._format_date(message.get('date'))}\n"
+                f"Subject: {message.get('subject', 'No Subject')}\n"
+                f"To: {to_email}\n\n"
+            )
+            
+            # Get message content
+            content = message.get('body', '')
+            html_content = message.get('html')
+            
+            # If content contains HTML but html_content is None, use content as HTML
+            if html_content is None and ('<html' in content.lower() or '<body' in content.lower() or '<div' in content.lower()):
+                html_content = content
+                # Create plain text from HTML
+                soup = BeautifulSoup(html_content, 'html.parser')
+                content = soup.get_text()
+            
+            # Create plain text part
+            text_part = forward_header + content
+            body.attach(MIMEText(text_part, 'plain', 'utf-8'))
+            
+            # Create HTML part
+            if html_content:
+                html_header = forward_header.replace('\n', '<br>')
+                full_html = f"""
+                <html>
+                    <head>
+                        <style>
+                            .forwarded-message {{
+                                margin: 20px 0;
+                                padding: 10px;
+                                border-left: 2px solid #ccc;
+                                color: #666;
+                            }}
+                            .message-content {{
+                                margin-top: 20px;
+                            }}
+                        </style>
+                    </head>
+                    <body>
+                        <div class="forwarded-message">
+                            {html_header}
+                        </div>
+                        <div class="message-content">
+                            {html_content}
+                        </div>
+                    </body>
+                </html>
+                """
+            else:
+                # Convert plain text to simple HTML
+                escaped_content = content.replace('\n', '<br>')
+                full_html = f"""
+                <html>
+                    <head>
+                        <style>
+                            .forwarded-message {{
+                                margin: 20px 0;
+                                padding: 10px;
+                                border-left: 2px solid #ccc;
+                                color: #666;
+                            }}
+                            .message-content {{
+                                margin-top: 20px;
+                                white-space: pre-wrap;
+                            }}
+                        </style>
+                    </head>
+                    <body>
+                        <div class="forwarded-message">
+                            {forward_header.replace('\n', '<br>')}
+                        </div>
+                        <div class="message-content">
+                            {escaped_content}
+                        </div>
+                    </body>
+                </html>
+                """
+            
+            body.attach(MIMEText(full_html, 'html', 'utf-8'))
+            msg.attach(body)
+            
+            # Add attachments if any
+            attachments = message.get('attachments', [])
+            if attachments:
+                for attachment in attachments:
+                    try:
+                        filename = attachment.get('filename', 'attachment.dat')
+                        content = attachment.get('content')
+                        
+                        if content:
+                            # Handle base64 encoded content if needed
+                            if isinstance(content, str):
+                                try:
+                                    content = base64.b64decode(content)
+                                except:
+                                    content = content.encode()
+                            
+                            # Create attachment part
+                            att = MIMEApplication(content)
+                            att.add_header(
+                                'Content-Disposition',
+                                'attachment',
+                                filename=filename
+                            )
+                            msg.attach(att)
+                            self.logger.info(f"Added attachment: {filename}")
+                    except Exception as e:
+                        self.logger.error(f"Failed to add attachment {filename}: {str(e)}")
+            
+            # Connect and send
+            with smtplib.SMTP(smtp_host, smtp_port) as server:
+                server.starttls()
+                server.login(smtp_user, smtp_pass)
+                server.send_message(msg)
+            
             return True
             
         except Exception as e:
-            self.logger.error(f"Error in manual forwarding: {str(e)}")
+            self.logger.error(f"Error forwarding email: {str(e)}")
             return False
 
     def validate_email(self, email: str) -> bool:
@@ -1002,32 +1122,58 @@ class TempMailManager:
         
         Returns:
             bool: True if email is valid, False otherwise
-        
-        Raises:
-            ValueError: If email format is invalid
         """
         try:
-            # Basic format validation
-            if not re.match(r"[^@]+@[^@]+\.[^@]+", email):
-                raise ValueError("Invalid email format")
-            
+            # Basic format validation using a more comprehensive regex
+            email_regex = r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
+            if not re.match(email_regex, email):
+                self.logger.error(f"Invalid email format: {email}")
+                return False
+                
             # Extract domain
             domain = email.split('@')[-1].lower()
             
-            # Check if domain is supported by any provider
+            # For source emails, check if domain is supported by any provider
             supported_domains = set()
             for provider in [GuerrillaMailAPI(), DisposableMailAPI(), 
                             YopMailAPI(), TempMailOrgAPI()]:
                 supported_domains.update(provider.get_available_domains())
             
-            if domain not in supported_domains:
-                return False
-            
+            # If email is in our providers, it must be from a supported domain
+            if any(email.lower().endswith('@' + d) for d in supported_domains):
+                return True
+                
+            # For external email addresses (like Gmail), just validate the format
             return True
-        
+            
         except Exception as e:
             self.logger.error(f"Email validation error: {str(e)}")
-            raise ValueError(f"Email validation failed: {str(e)}")
+            return False
+
+    def get_provider_by_domain(self, email: str) -> Optional[TempMailAPI]:
+        """
+        Get the email provider instance for a given email address based on its domain
+        
+        Args:
+            email (str): Email address
+            
+        Returns:
+            Optional[TempMailAPI]: Provider instance if found, None otherwise
+        """
+        try:
+            domain = email.split('@')[-1].lower()
+            
+            # Check each provider's supported domains
+            for provider in [GuerrillaMailAPI(), DisposableMailAPI(), 
+                           YopMailAPI(), TempMailOrgAPI()]:
+                if domain in provider.get_available_domains():
+                    return provider
+                    
+            return None
+            
+        except Exception as e:
+            self.logger.error(f"Error getting provider for email: {str(e)}")
+            return None
 
 def main():
     """Example usage of TempMailManager"""
@@ -1076,621 +1222,206 @@ if __name__ == "__main__":
     main()
 
 class YopMailAPI(TempMailAPI):
-    """YopMail provider - Free and no auth required"""
+    """API client for YopMail"""
+    
     def __init__(self):
-        """Initialize provider"""
-        self.base_url = "https://yopmail.com/en"
-        self.api_url = "https://yopmail.com/inbox"
-        self.domains = [
-            "yopmail.com",
-            "yopmail.net",
-            "yopmail.org",
-            "cool.fr.nf",
-            "jetable.fr.nf",
-            "nospam.ze.tc",
-            "nomail.xl.cx"
-        ]
-        self.session = retry_with_backoff()
-
-    def generate_random_username(self) -> str:
-        """Generate a random username with consistent pattern"""
-        username = ''.join(random.choices(string.ascii_lowercase, k=4))
-        username += ''.join(random.choices(string.digits, k=4))
-        username += ''.join(random.choices(string.ascii_lowercase, k=4))
-        return username
-
+        self.session = requests.Session()
+        self.session.headers.update({
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+        })
+        self.base_url = "https://yopmail.com"
+        
+    def get_available_domains(self) -> List[str]:
+        return ["yopmail.com", "yopmail.net", "cool.fr.nf", "jetable.fr.nf", 
+                "nospam.ze.tc", "nomail.xl.cx", "mega.zik.dj", "speed.1s.fr"]
+                
     def generate_email(self) -> str:
-        """Generate a new email address"""
         try:
-            # Generate random username with consistent pattern
-            username = self.generate_random_username()
-            
-            # Use most reliable domain
-            domain = "yopmail.com"
-            
-            # Create email
-            email = f"{username}@{domain}"
-            
-            # Verify email is accessible
-            response = self.session.get(
-                f"{self.api_url}/{username}",
-                headers={"User-Agent": "Mozilla/5.0"},
-                timeout=10
-            )
-            response.raise_for_status()
-            
-            return email
-            
+            username = ''.join(random.choices(string.ascii_lowercase + string.digits, k=10))
+            domain = random.choice(self.get_available_domains())
+            return f"{username}@{domain}"
         except Exception as e:
-            logging.error(f"Error generating YopMail address: {str(e)}")
-            raise EmailGenerationError("Failed to generate YopMail address")
+            raise ValueError(f"Failed to generate YopMail address: {str(e)}")
 
     def get_messages(self, email: str) -> List[Dict]:
-        """Get messages for an email address"""
         try:
             login = email.split('@')[0]
-            
-            # Get inbox
-            response = self.session.get(
-                f"{self.api_url}/{login}",
-                headers={
-                    "User-Agent": "Mozilla/5.0",
-                    "Accept": "application/json"
-                }
-            )
+            response = self.session.get(f"{self.base_url}/inbox/{login}")
             response.raise_for_status()
-            
-            # Parse HTML response
             soup = BeautifulSoup(response.text, 'html.parser')
             messages = []
-            
-            # Find message elements
-            message_elements = soup.select('.m')
-            for element in message_elements:
-                try:
-                    msg_id = element.get('id')
-                    if msg_id:
-                        msg = self.get_message(email, msg_id)
-                        if msg:
-                            messages.append(msg)
-                except Exception as e:
-                    logging.error(f"Error processing message {msg_id}: {str(e)}")
-                    continue
-            
+            for msg in soup.select('.m'):
+                msg_id = msg.get('id')
+                if msg_id:
+                    messages.append({
+                        'id': msg_id,
+                        'subject': msg.select_one('.lms').text if msg.select_one('.lms') else 'No Subject',
+                        'from': msg.select_one('.lmf').text if msg.select_one('.lmf') else 'Unknown',
+                        'date': msg.select_one('.lmd').text if msg.select_one('.lmd') else 'Unknown'
+                    })
             return messages
-            
         except Exception as e:
-            logging.error(f"Error getting messages from YopMail: {str(e)}")
+            logging.error(f"Error getting messages: {str(e)}")
             return []
 
     def get_message(self, email: str, message_id: str) -> Optional[Dict]:
-        """Get a specific message"""
         try:
             login = email.split('@')[0]
-            
-            # Get message content
-            response = self.session.get(
-                f"{self.api_url}/{login}/{message_id}",
-                headers={
-                    "User-Agent": "Mozilla/5.0",
-                    "Accept": "application/json"
-                }
-            )
+            response = self.session.get(f"{self.base_url}/inbox/{login}/{message_id}")
             response.raise_for_status()
-            
-            # Parse HTML response
             soup = BeautifulSoup(response.text, 'html.parser')
-            
-            # Extract message details
-            subject = soup.select_one('.hm').text.strip() if soup.select_one('.hm') else 'No Subject'
-            sender = soup.select_one('.ellipsis').text.strip() if soup.select_one('.ellipsis') else 'Unknown'
-            date = soup.select_one('.hm_date').text.strip() if soup.select_one('.hm_date') else 'Unknown'
-            
-            # Get message body
-            body_element = soup.select_one('.mail')
-            body = body_element.get_text(strip=True) if body_element else ''
-            
+            body = soup.select_one('#mail')
             return {
                 'id': message_id,
-                'from': sender,
-                'subject': subject,
-                'date': date,
-                'body': body
+                'subject': soup.select_one('.hm').text if soup.select_one('.hm') else 'No Subject',
+                'from': soup.select_one('.lmf').text if soup.select_one('.lmf') else 'Unknown',
+                'date': soup.select_one('.lmd').text if soup.select_one('.lmd') else 'Unknown',
+                'body': body.get_text() if body else ''
             }
-            
         except Exception as e:
-            logging.error(f"Error getting message from YopMail: {str(e)}")
+            logging.error(f"Error getting message: {str(e)}")
             return None
 
     def get_provider_name(self) -> str:
-        """Get provider name"""
         return "YopMail"
 
-    def get_available_domains(self) -> List[str]:
-        """Get list of available domains"""
-        return self.domains
-
-    def send_message(self, message_data: Dict) -> bool:
-        """Send a message using YopMail API"""
-        try:
-            # Format message data
-            data = {
-                'to': message_data['to'],
-                'subject': message_data['subject'],
-                'body': message_data.get('html', message_data['body']),
-                'from': message_data.get('from', ''),
-                'attachments': message_data.get('attachments', [])
-            }
-            
-            # Use YopMail's API to send message
-            response = requests.post(
-                'https://yopmail.com/en/mail',
-                json=data,
-                timeout=30
-            )
-            response.raise_for_status()
-            
-            return True
-            
-        except Exception as e:
-            logging.error(f"Error sending message via YopMail: {str(e)}")
-            return False
-
-    def forward_message(self, to_email: str, message_data: Dict) -> bool:
-        """Forward a message using YopMail API"""
-        try:
-            # Format message for forwarding
-            forward_data = {
-                'to': to_email,
-                'subject': message_data['subject'],
-                'from': message_data.get('forwarded_from', ''),
-                'body': message_data.get('html', message_data['body']),
-                'attachments': message_data.get('attachments', [])
-            }
-            
-            return self.send_message(forward_data)
-            
-        except Exception as e:
-            logging.error(f"Error forwarding message via YopMail: {str(e)}")
-            return False
-
 class TempMailOrgAPI(TempMailAPI):
-    """Temp-Mail.org provider - Free and no auth required"""
+    """API client for Temp-Mail.org"""
+    
     def __init__(self):
-        """Initialize provider"""
-        self.base_url = "https://temp-mail.org/api/v3"
-        self.domains = [
-            "temp-mail.org",
-            "temp-mail.com",
-            "tmpmail.org",
-            "tmpmail.net",
-            "tmails.net"
-        ]
-        self.session = retry_with_backoff()
-        self._token = None
-
-    def generate_random_username(self) -> str:
-        """Generate a random username with consistent pattern"""
-        username = ''.join(random.choices(string.ascii_lowercase, k=4))
-        username += ''.join(random.choices(string.digits, k=4))
-        username += ''.join(random.choices(string.ascii_lowercase, k=4))
-        return username
-
-    def _get_token(self) -> Optional[str]:
-        """Get authentication token"""
+        self.session = requests.Session()
+        self.session.headers.update({
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+        })
+        self.base_url = "https://web2.temp-mail.org"
+        
+    def get_available_domains(self) -> List[str]:
         try:
-            if self._token:
-                return self._token
-                
-            response = self.session.post(
-                f"{self.base_url}/token",
-                headers={"User-Agent": "Mozilla/5.0"}
-            )
+            response = self.session.get(f"{self.base_url}/api/v3/domains")
             response.raise_for_status()
-            self._token = response.json().get('token')
-            return self._token
-            
+            return response.json()
         except Exception as e:
-            logging.error(f"Error getting token: {str(e)}")
-            return None
+            logging.error(f"Error getting domains: {str(e)}")
+            return ["temp-mail.org", "temp-mail.com"]
 
     def generate_email(self) -> str:
-        """Generate a new email address"""
         try:
-            # Generate random username with consistent pattern
-            username = self.generate_random_username()
-            
-            # Use most reliable domain
-            domain = "temp-mail.org"
-            
-            # Create email
-            email = f"{username}@{domain}"
-            
-            # Get token and validate email
-            token = self._get_token()
-            if not token:
-                raise EmailGenerationError("Failed to get authentication token")
-                
-            headers = {'Authorization': f'Bearer {token}'}
-            response = self.session.post(
-                f"{self.base_url}/email/new",
-                json={'email': email},
-                headers=headers,
-                timeout=10
-            )
-            response.raise_for_status()
-            
-            return email
-            
+            username = ''.join(random.choices(string.ascii_lowercase + string.digits, k=10))
+            domains = self.get_available_domains()
+            domain = random.choice(domains)
+            return f"{username}@{domain}"
         except Exception as e:
-            logging.error(f"Error generating Temp-Mail.org address: {str(e)}")
-            raise EmailGenerationError("Failed to generate Temp-Mail.org address")
+            raise ValueError(f"Failed to generate Temp-Mail.org address: {str(e)}")
 
     def get_messages(self, email: str) -> List[Dict]:
-        """Get messages for an email address"""
         try:
-            # Get token
-            token = self._get_token()
-            if not token:
-                return []
-            
-            # Get messages
-            response = self.session.get(
-                f"{self.base_url}/email/{email}/messages",
-                headers={
-                    "Authorization": f"Bearer {token}",
-                    "User-Agent": "Mozilla/5.0"
-                }
-            )
+            response = self.session.get(f"{self.base_url}/api/v3/email/{email}/messages")
             response.raise_for_status()
-            messages_data = response.json()
-            
-            messages = []
-            for msg in messages_data:
-                try:
-                    msg_id = msg.get('id')
-                    if msg_id:
-                        full_msg = self.get_message(email, str(msg_id))
-                        if full_msg:
-                            messages.append(full_msg)
-                except Exception as e:
-                    logging.error(f"Error processing message {msg.get('id')}: {str(e)}")
-                    continue
-            
-            return messages
-            
+            return [{
+                'id': str(msg['id']),
+                'subject': msg.get('subject', 'No Subject'),
+                'from': msg.get('from', 'Unknown'),
+                'date': msg.get('created_at', 'Unknown')
+            } for msg in response.json()]
         except Exception as e:
-            logging.error(f"Error getting messages from Temp-Mail.org: {str(e)}")
+            logging.error(f"Error getting messages: {str(e)}")
             return []
 
     def get_message(self, email: str, message_id: str) -> Optional[Dict]:
-        """Get a specific message"""
         try:
-            # Get token
-            token = self._get_token()
-            if not token:
-                return None
-            
-            # Get message
-            response = self.session.get(
-                f"{self.base_url}/email/{email}/messages/{message_id}",
-                headers={
-                    "Authorization": f"Bearer {token}",
-                    "User-Agent": "Mozilla/5.0"
-                }
-            )
+            response = self.session.get(f"{self.base_url}/api/v3/email/{email}/messages/{message_id}")
             response.raise_for_status()
             msg = response.json()
-            
             return {
-                'id': str(msg.get('id')),
-                'from': msg.get('from'),
-                'subject': msg.get('subject'),
-                'date': msg.get('created_at'),
-                'body': msg.get('text_body', msg.get('html_body', ''))
+                'id': str(msg['id']),
+                'subject': msg.get('subject', 'No Subject'),
+                'from': msg.get('from', 'Unknown'),
+                'date': msg.get('created_at', 'Unknown'),
+                'body': msg.get('body', '')
             }
-            
         except Exception as e:
-            logging.error(f"Error getting message from Temp-Mail.org: {str(e)}")
+            logging.error(f"Error getting message: {str(e)}")
             return None
 
     def get_provider_name(self) -> str:
-        """Get provider name"""
         return "Temp-Mail.org"
 
-    def get_available_domains(self) -> List[str]:
-        """Get list of available domains"""
-        return self.domains
-
-    def send_message(self, message_data: Dict) -> bool:
-        """Send a message using Temp-Mail.org API"""
-        try:
-            # Get token for authentication
-            token = self._get_token()
-            if not token:
-                return False
-            
-            # Format message data
-            data = {
-                'to': message_data['to'],
-                'subject': message_data['subject'],
-                'text': message_data['body'],
-                'html': message_data.get('html'),
-                'from': message_data.get('from', ''),
-                'attachments': message_data.get('attachments', [])
-            }
-            
-            # Send message using API
-            headers = {'Authorization': f'Bearer {token}'}
-            response = requests.post(
-                'https://api.temp-mail.org/request/send',
-                json=data,
-                headers=headers,
-                timeout=30
-            )
-            response.raise_for_status()
-            
-            return True
-            
-        except Exception as e:
-            logging.error(f"Error sending message via Temp-Mail.org: {str(e)}")
-            return False
-
-    def forward_message(self, to_email: str, message_data: Dict) -> bool:
-        """Forward a message using Temp-Mail.org API"""
-        try:
-            # Format message for forwarding
-            forward_data = {
-                'to': to_email,
-                'subject': message_data['subject'],
-                'text': message_data['body'],
-                'html': message_data.get('html'),
-                'from': message_data.get('forwarded_from', ''),
-                'attachments': message_data.get('attachments', [])
-            }
-            
-            return self.send_message(forward_data)
-            
-        except Exception as e:
-            logging.error(f"Error forwarding message via Temp-Mail.org: {str(e)}")
-            return False
-
 class DisposableMailAPI(TempMailAPI):
-    """1secmail.com provider - Free and no auth required"""
+    """API client for 1secmail"""
+    
     def __init__(self):
-        """Initialize provider"""
-        self.base_url = "https://www.1secmail.com/api/v1/"
-        self.domains = [
-            "1secmail.com",  # Most reliable domain
-            "1secmail.org",
-            "1secmail.net"
-        ]
-        self.session = retry_with_backoff()
+        self.session = requests.Session()
+        self.session.headers.update({
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+        })
+        self.base_url = "https://www.1secmail.net"
+        
+    def get_available_domains(self) -> List[str]:
+        try:
+            response = self.session.get(f"{self.base_url}/api/v1/?action=getDomainList")
+            response.raise_for_status()
+            return response.json()
+        except Exception as e:
+            logging.error(f"Error getting domains: {str(e)}")
+            return ["1secmail.com", "1secmail.org", "1secmail.net"]
 
-    def generate_random_username(self) -> str:
-        """Generate a random username with consistent pattern"""
-        username = ''.join(random.choices(string.ascii_lowercase, k=4))
-        username += ''.join(random.choices(string.digits, k=4))
-        username += ''.join(random.choices(string.ascii_lowercase, k=4))
-        return username
+    def generate_email(self) -> str:
+        try:
+            username = ''.join(random.choices(string.ascii_lowercase + string.digits, k=10))
+            domain = random.choice(self.get_available_domains())
+            return f"{username}@{domain}"
+        except Exception as e:
+            raise ValueError(f"Failed to generate 1secmail address: {str(e)}")
 
-    def _validate_email(self, email: str) -> bool:
-        """Validate email exists and is ready for use"""
+    def get_messages(self, email: str) -> List[Dict]:
         try:
             login, domain = email.split('@')
             response = self.session.get(
-                f"{self.base_url}",
+                f"{self.base_url}/api/v1/",
                 params={
                     "action": "getMessages",
                     "login": login,
                     "domain": domain
                 }
             )
-            return response.status_code == 200
-        except Exception:
-            return False
-
-    def generate_email(self) -> str:
-        """Generate a new email address"""
-        try:
-            # Generate random username with consistent pattern
-            username = self.generate_random_username()
-            
-            # Use most reliable domain
-            domain = "1secmail.com"
-            
-            # Create email
-            email = f"{username}@{domain}"
-            
-            # Validate email exists
-            response = self.session.get(
-                f"{self.base_url}",
-                params={
-                    'action': 'genRandomMailbox',
-                    'count': 1
-                },
-                timeout=10
-            )
             response.raise_for_status()
-            
-            # Verify email was created
-            if not self._validate_email(email):
-                raise EmailGenerationError("Failed to validate email")
-            
-            return email
-            
+            return [{
+                'id': str(msg['id']),
+                'subject': msg.get('subject', 'No Subject'),
+                'from': msg.get('from', 'Unknown'),
+                'date': msg.get('date', 'Unknown')
+            } for msg in response.json()]
         except Exception as e:
-            logging.error(f"Error generating 1secmail address: {str(e)}")
-            raise EmailGenerationError("Failed to generate 1secmail address")
-
-    def get_messages(self, email: str) -> List[Dict]:
-        """Get messages for an email address"""
-        try:
-            login, domain = email.split('@')
-            
-            # Verify email is valid
-            if not self._validate_email(email):
-                logging.error(f"Email {email} is not valid or accessible")
-                return []
-            
-            # Get messages with retry
-            for attempt in range(3):
-                try:
-                    response = self.session.get(
-                        f"{self.base_url}",
-                        params={
-                            "action": "getMessages",
-                            "login": login,
-                            "domain": domain
-                        }
-                    )
-                    response.raise_for_status()
-                    messages_data = response.json()
-                    
-                    messages = []
-                    for msg in messages_data:
-                        try:
-                            msg_id = msg.get('id')
-                            if msg_id:
-                                full_msg = self.get_message(email, str(msg_id))
-                                if full_msg:
-                                    messages.append(full_msg)
-                        except Exception as e:
-                            logging.error(f"Error processing message {msg.get('id')}: {str(e)}")
-                            continue
-                    
-                    return messages
-                    
-                except Exception as e:
-                    logging.error(f"Error on attempt {attempt + 1}: {str(e)}")
-                    if attempt < 2:  # Not the last attempt
-                        sleep(2)  # Wait before retry
-            
-            return []
-            
-        except Exception as e:
-            logging.error(f"Error getting messages from 1secmail: {str(e)}")
+            logging.error(f"Error getting messages: {str(e)}")
             return []
 
     def get_message(self, email: str, message_id: str) -> Optional[Dict]:
-        """Get a specific message"""
         try:
             login, domain = email.split('@')
-            
-            # Get message with retry
-            for attempt in range(3):
-                try:
-                    response = self.session.get(
-                        f"{self.base_url}",
-                        params={
-                            "action": "readMessage",
-                            "login": login,
-                            "domain": domain,
-                            "id": message_id
-                        }
-                    )
-                    response.raise_for_status()
-                    msg = response.json()
-                    
-                    # Extract attachments if any
-                    attachments = []
-                    if msg.get('attachments'):
-                        for attachment in msg['attachments']:
-                            try:
-                                att_response = self.session.get(
-                                    f"{self.base_url}",
-                                    params={
-                                        "action": "download",
-                                        "login": login,
-                                        "domain": domain,
-                                        "id": message_id,
-                                        "file": attachment['filename']
-                                    }
-                                )
-                                if att_response.status_code == 200:
-                                    attachments.append({
-                                        'filename': attachment['filename'],
-                                        'content': att_response.content
-                                    })
-                            except Exception as e:
-                                logging.error(f"Error downloading attachment: {str(e)}")
-                    
-                    return {
-                        'id': str(msg.get('id')),
-                        'from': msg.get('from'),
-                        'subject': msg.get('subject'),
-                        'date': msg.get('date'),
-                        'body': msg.get('textBody', msg.get('htmlBody', ''))
-                    }
-                    
-                except Exception as e:
-                    logging.error(f"Error on attempt {attempt + 1}: {str(e)}")
-                    if attempt < 2:  # Not the last attempt
-                        sleep(2)  # Wait before retry
-            
-            return None
-            
+            response = self.session.get(
+                f"{self.base_url}/api/v1/",
+                params={
+                    "action": "readMessage",
+                    "login": login,
+                    "domain": domain,
+                    "id": message_id
+                }
+            )
+            response.raise_for_status()
+            msg = response.json()
+            return {
+                'id': str(msg['id']),
+                'subject': msg.get('subject', 'No Subject'),
+                'from': msg.get('from', 'Unknown'),
+                'date': msg.get('date', 'Unknown'),
+                'body': msg.get('body', '')
+            }
         except Exception as e:
-            logging.error(f"Error getting message from 1secmail: {str(e)}")
+            logging.error(f"Error getting message: {str(e)}")
             return None
 
     def get_provider_name(self) -> str:
-        """Get provider name"""
         return "1secmail"
-
-    def get_available_domains(self) -> List[str]:
-        """Get list of available domains"""
-        return self.domains
-
-    def send_message(self, message_data: Dict) -> bool:
-        """Send a message using 1secmail API"""
-        try:
-            # Format message data
-            data = {
-                'to': message_data['to'],
-                'subject': message_data['subject'],
-                'body': message_data.get('html', message_data['body']),
-                'from': message_data.get('from', ''),
-                'attachments': message_data.get('attachments', [])
-            }
-            
-            # Send message using API
-            response = requests.post(
-                'https://www.1secmail.com/api/v1/',
-                params={'action': 'send'},
-                json=data,
-                timeout=30
-            )
-            response.raise_for_status()
-            
-            result = response.json()
-            if result.get('status') == 'success':
-                return True
-            else:
-                logging.error(f"Failed to send message: {result.get('message', 'Unknown error')}")
-                return False
-                
-        except Exception as e:
-            logging.error(f"Error sending message via 1secmail: {str(e)}")
-            return False
-
-    def forward_message(self, to_email: str, message_data: Dict) -> bool:
-        """Forward a message using 1secmail API"""
-        try:
-            # Format message for forwarding
-            forward_data = {
-                'to': to_email,
-                'subject': message_data['subject'],
-                'from': message_data.get('forwarded_from', ''),
-                'body': message_data.get('html', message_data['body']),
-                'attachments': message_data.get('attachments', [])
-            }
-            
-            return self.send_message(forward_data)
-            
-        except Exception as e:
-            logging.error(f"Error forwarding message via 1secmail: {str(e)}")
-            return False
 
 class GuerrillaMailAPI(TempMailAPI):
     """Guerrilla Mail provider"""
