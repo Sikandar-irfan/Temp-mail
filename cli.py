@@ -14,6 +14,9 @@ from rich.panel import Panel
 from rich.console import Console
 from rich.prompt import Prompt, Confirm
 from typing import Dict, List, Optional
+import requests
+import json
+from logging.handlers import RotatingFileHandler
 
 from temp_mail_manager import (
     TempMailManager,
@@ -24,18 +27,62 @@ from temp_mail_manager import (
     TempMailAPI
 )
 
-# Setup logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - [%(filename)s:%(lineno)d] - %(message)s'
-)
-logger = logging.getLogger('temp_mail_cli')
+# Logging setup
+def setup_logging():
+    """Configure logging to write to files instead of console"""
+    # Create logs directory if it doesn't exist
+    log_dir = os.path.join(os.path.dirname(__file__), 'logs')
+    os.makedirs(log_dir, exist_ok=True)
+    
+    # Setup file handlers
+    app_log = os.path.join(log_dir, 'app.log')
+    error_log = os.path.join(log_dir, 'error.log')
+    
+    # Configure root logger
+    root_logger = logging.getLogger()
+    root_logger.setLevel(logging.INFO)
+    
+    # Clear any existing handlers
+    root_logger.handlers = []
+    
+    # Create formatters
+    file_formatter = logging.Formatter(
+        '%(asctime)s - %(name)s - %(levelname)s - [%(filename)s:%(lineno)d] - %(message)s'
+    )
+    
+    # Setup file handlers
+    file_handler = RotatingFileHandler(
+        app_log,
+        maxBytes=10*1024*1024,  # 10MB
+        backupCount=5
+    )
+    file_handler.setLevel(logging.INFO)
+    file_handler.setFormatter(file_formatter)
+    
+    error_handler = RotatingFileHandler(
+        error_log,
+        maxBytes=10*1024*1024,  # 10MB
+        backupCount=5
+    )
+    error_handler.setLevel(logging.ERROR)
+    error_handler.setFormatter(file_formatter)
+    
+    # Add handlers to root logger
+    root_logger.addHandler(file_handler)
+    root_logger.addHandler(error_handler)
+    
+    # Prevent logs from being printed to console
+    root_logger.propagate = False
 
 # Initialize console
 console = Console()
 
 # Initialize manager
 active_manager = TempMailManager()
+setup_logging()
+
+# Initialize stop events for monitoring
+monitoring_stop_events = {}
 
 # Global state
 is_running = True
@@ -72,7 +119,7 @@ def cleanup(signum=None, frame=None):
             cleanup.goodbye_displayed = True
             
     except Exception as e:
-        logger.error(f"Error during cleanup: {str(e)}")
+        logging.getLogger('temp_mail_cli').error(f"Error during cleanup: {str(e)}")
         
     finally:
         # Ensure we exit
@@ -88,27 +135,31 @@ signal.signal(signal.SIGINT, signal_handler)
 signal.signal(signal.SIGTERM, signal_handler)
 atexit.register(cleanup)
 
-def list_emails(active_only=False):
-    """
-    List emails with optional filtering
-    
-    Args:
-        active_only (bool): If True, return only active emails
-    
-    Returns:
-        List[Dict]: List of email dictionaries
-    """
-    global active_manager
-    
-    if active_only:
-        # Filter for active emails (you might want to define what makes an email 'active')
-        return [
-            email for email in active_manager.emails_data 
-            if email.get('is_active', True)  # Assuming there's an 'is_active' flag
-        ]
-    else:
-        # Return all emails
-        return active_manager.emails_data
+def list_emails(active_only=True) -> List[Dict]:
+    """List all emails or only active ones"""
+    try:
+        emails = []
+        if active_only:
+            active_emails = active_manager.get_active_emails()
+            for email in active_emails:
+                provider = active_manager.get_provider_for_email(email)
+                if provider:
+                    emails.append({
+                        'email': email,
+                        'provider': provider.__class__.__name__,
+                        'created_at': active_manager.emails[email].get('created_at', 'Unknown')
+                    })
+        else:
+            for email, data in active_manager.emails.items():
+                emails.append({
+                    'email': email,
+                    'provider': data.get('provider_class', 'Unknown'),
+                    'created_at': data.get('created_at', 'Unknown')
+                })
+        return emails
+    except Exception as e:
+        logging.getLogger('temp_mail_cli').error(f"Error listing emails: {str(e)}")
+        return []
 
 def clear_screen():
     """Clear the terminal screen"""
@@ -184,13 +235,13 @@ def generate_email():
             console.print("[red]Failed to generate email[/red]")
             
     except Exception as e:
-        logger.error(f"Error generating email: {str(e)}")
+        logging.getLogger('temp_mail_cli').error(f"Error generating email: {str(e)}")
         console.print("[red]Failed to generate email. Please try another provider.[/red]")
 
 def select_email_to_monitor():
     """Select an email to monitor from active emails"""
     try:
-        if not active_manager.emails_data:
+        if not active_manager.emails:
             console.print("[yellow]No active emails found. Generate an email first.[/]")
             return None
 
@@ -200,12 +251,12 @@ def select_email_to_monitor():
         table.add_column("Provider", justify="center")
         table.add_column("Created At", justify="center")
 
-        for idx, email_data in enumerate(active_manager.emails_data, 1):
+        for idx, email_data in enumerate(active_manager.emails.items(), 1):
             table.add_row(
                 str(idx),
-                email_data['email'],
-                email_data.get('provider', 'Unknown'),
-                email_data.get('created_at', 'Unknown')
+                email_data[0],
+                email_data[1].get('provider_class', 'Unknown'),
+                email_data[1].get('created_at', 'Unknown')
             )
 
         console.print(table)
@@ -218,15 +269,15 @@ def select_email_to_monitor():
                 show_default=True
             )
             
-            if 1 <= choice <= len(active_manager.emails_data):
-                selected_email = active_manager.emails_data[choice-1]['email']
+            if 1 <= choice <= len(active_manager.emails):
+                selected_email = list(active_manager.emails.keys())[choice-1]
                 console.print(f"\nSelected: {selected_email}")
                 return selected_email
             else:
                 console.print("[red]Invalid selection. Please try again.[/]")
 
     except Exception as e:
-        logger.error(f"Error selecting email: {str(e)}")
+        logging.getLogger('temp_mail_cli').error(f"Error selecting email: {str(e)}")
         console.print("[red]Error selecting email. Please try again.[/]")
         return None
 
@@ -243,35 +294,49 @@ def display_message(message: dict):
     console.print(panel)
 
 def monitor_email_thread(email: str, stop_event: threading.Event):
-    """Monitor email for new messages"""
+    """
+    Monitor email for new messages in a separate thread
+    
+    Args:
+        email (str): Email address to monitor
+        stop_event (threading.Event): Event to signal thread stop
+    """
     try:
-        provider = active_manager.get_provider_for_email(email)
-        if not provider:
-            logger.error(f"No provider found for email: {email}")
-            return
-
-        seen_message_ids = set()
+        last_check_time = time.time()
+        check_interval = 10  # seconds
+        timeout = 5  # seconds
+        
         while not stop_event.is_set():
             try:
-                messages = provider.get_messages(email)
-                for message in messages:
-                    msg_id = str(message.get('id'))
-                    if msg_id not in seen_message_ids:
-                        seen_message_ids.add(msg_id)
-                        console.print(Panel(f"""
-[bold green]New Message![/bold green]
-From: {message.get('from', 'Unknown')}
-Subject: {message.get('subject', 'No Subject')}
-Date: {message.get('date', 'Unknown')}
-""", title=f"Email: {email}"))
-
-                time.sleep(10)  # Check every 10 seconds
+                current_time = time.time()
+                if current_time - last_check_time >= check_interval:
+                    provider = active_manager.get_provider_for_email(email)
+                    if not provider:
+                        logging.getLogger('temp_mail_cli').error(f"No provider found for email: {email}")
+                        break
+                        
+                    # Get messages with timeout
+                    messages = provider.get_messages(email)
+                    if messages:
+                        for message in messages:
+                            display_message(message)
+                            
+                    last_check_time = current_time
+                    
+                # Sleep for a short interval to prevent CPU overuse
+                time.sleep(1)
+                
+            except requests.Timeout:
+                logging.getLogger('temp_mail_cli').warning(f"Timeout while checking messages for {email}")
+                continue
             except Exception as e:
-                logger.error(f"Error monitoring email {email}: {str(e)}")
-                time.sleep(30)  # Wait longer on error
+                logging.getLogger('temp_mail_cli').error(f"Error monitoring email {email}: {str(e)}")
+                time.sleep(check_interval)  # Wait before retrying
                 
     except Exception as e:
-        logger.error(f"Monitor thread error for {email}: {str(e)}")
+        logging.getLogger('temp_mail_cli').error(f"Monitor thread error for {email}: {str(e)}")
+    finally:
+        logging.getLogger('temp_mail_cli').info(f"Stopped monitoring {email}")
 
 def start_monitoring(email: str):
     """Start monitoring an email address"""
@@ -283,83 +348,78 @@ def start_monitoring(email: str):
     console.print(f"[green]Started monitoring {email}[/green]")
 
 def check_messages(email: str = None):
-    """Check messages for an email address"""
+    """
+    Check messages for an email address with timeout handling
+    
+    Args:
+        email (str, optional): Email address to check. If None, user will be prompted
+    """
     try:
-        if not active_manager.emails:
-            console.print("[yellow]No active emails[/yellow]")
-            return
-
-        if email is None:
-            # Let user select email
-            email = questionary.select(
-                "Select email to check:",
-                choices=list(active_manager.emails.keys())
-            ).ask()
-
         if not email:
-            return
-
+            emails = list_emails(active_only=True)
+            if not emails:
+                console.print("[yellow]No active emails found. Generate an email first.[/]")
+                return
+                
+            # Let user select email
+            email_choice = questionary.select(
+                "Select email to check:",
+                choices=[e['email'] for e in emails]
+            ).ask()
+            
+            if not email_choice:
+                return
+                
+            email = email_choice
+            
+        # Get provider with timeout
         provider = active_manager.get_provider_for_email(email)
         if not provider:
-            console.print(f"[red]No provider found for {email}[/red]")
+            console.print(f"[red]No provider found for email: {email}[/]")
             return
-
-        messages = provider.get_messages(email)
-        
-        # Create table
-        table = Table(show_header=True, header_style="bold magenta")
-        table.add_column("ID", style="cyan")
-        table.add_column("From", style="green")
-        table.add_column("Subject", style="blue")
-        table.add_column("Date", style="magenta")
-
-        valid_messages = []
-        if messages and isinstance(messages, list):
-            for message in messages:
-                if not isinstance(message, dict):
-                    continue
-                    
-                msg_id = str(message.get('id', ''))
-                msg_from = str(message.get('from', 'Unknown'))
-                msg_subject = str(message.get('subject', 'No Subject'))
-                msg_date = str(message.get('date', 'Unknown'))
+            
+        try:
+            with console.status(f"[bold blue]Checking messages for {email}...[/]"):
+                messages = active_manager.get_messages(email)
                 
-                if msg_id:
-                    valid_messages.append(message)
-                    table.add_row(
-                        msg_id,
-                        msg_from,
-                        msg_subject,
-                        msg_date
-                    )
-
-        if valid_messages:
+            if not messages:
+                console.print("[yellow]No messages found.[/]")
+                return
+                
+            # Display messages in a table
+            table = Table(title=f"Messages for {email}")
+            table.add_column("ID", justify="center")
+            table.add_column("From", justify="left")
+            table.add_column("Subject", justify="left")
+            table.add_column("Date", justify="center")
+            
+            for msg in messages:
+                table.add_row(
+                    str(msg.get('id', 'N/A')),
+                    msg.get('from', 'Unknown'),
+                    msg.get('subject', 'No Subject'),
+                    msg.get('date', 'Unknown')
+                )
+                
             console.print(table)
             
-            # Let user select message to view details
-            msg_id = questionary.select(
-                "Select message to view details:",
-                choices=[str(msg.get('id', '')) for msg in valid_messages]
-            ).ask()
-            
-            if msg_id:
-                message = provider.get_message(email, msg_id)
+            # Ask if user wants to view a message
+            if Confirm.ask("View a message?"):
+                msg_id = Prompt.ask("Enter message ID")
+                message = active_manager.get_message(email, msg_id)
                 if message:
-                    console.print(Panel(f"""
-[bold]From:[/bold] {str(message.get('from', 'Unknown'))}
-[bold]Subject:[/bold] {str(message.get('subject', 'No Subject'))}
-[bold]Date:[/bold] {str(message.get('date', 'Unknown'))}
-[bold]Body:[/bold]
-{str(message.get('body', 'No Body'))}
-""", title="Message Details"))
+                    display_message(message)
                 else:
-                    console.print("[red]Failed to retrieve message details[/red]")
-        else:
-            console.print("[yellow]No messages found[/yellow]")
-
+                    console.print("[red]Message not found.[/]")
+                    
+        except requests.Timeout:
+            console.print("[red]Request timed out. Please try again.[/]")
+        except Exception as e:
+            console.print(f"[red]Error checking messages: {str(e)}[/]")
+            
     except Exception as e:
-        logger.error(f"Error checking messages: {str(e)}")
-        console.print("[red]Error checking messages[/red]")
+        logging.getLogger('temp_mail_cli').error(f"Error in check_messages: {str(e)}")
+        console.print("[red]An error occurred while checking messages.[/]")
 
 def monitor_emails():
     """Monitor emails for new messages"""
@@ -390,7 +450,7 @@ def monitor_emails():
             console.print("\n[yellow]Stopping email monitoring...[/yellow]")
             
     except Exception as e:
-        logger.error(f"Error in monitor_emails: {str(e)}")
+        logging.getLogger('temp_mail_cli').error(f"Error in monitor_emails: {str(e)}")
         console.print("[red]Error monitoring emails[/red]")
 
 def stop_monitoring(email_address: str):
@@ -400,15 +460,41 @@ def stop_monitoring(email_address: str):
         thread.join(timeout=1)
         monitoring_threads.remove((thread, event))
 
+def list_active_emails():
+    """List all active emails"""
+    try:
+        emails = list_emails(active_only=True)
+        if not emails:
+            console.print("[yellow]No active emails found[/]")
+            return
+            
+        table = Table(title="Active Emails")
+        table.add_column("Email", style="cyan")
+        table.add_column("Provider", style="green")
+        table.add_column("Created At", style="blue")
+        
+        for email in emails:
+            table.add_row(
+                email['email'],
+                email['provider'],
+                email['created_at']
+            )
+            
+        console.print(table)
+        
+    except Exception as e:
+        logging.getLogger('temp_mail_cli').error(f"Error listing active emails: {str(e)}")
+        console.print("[red]Failed to list active emails[/]")
+
 def show_analytics():
     """Display email analytics"""
     try:
-        if not active_manager or not active_manager.emails_data:
+        if not active_manager or not active_manager.emails:
             console.print("[yellow]No email data available for analytics.[/]")
             return
 
-        total_emails = len(active_manager.emails_data)
-        active_emails = len([e for e in active_manager.emails_data if e.get('is_active', True)])
+        total_emails = len(active_manager.emails)
+        active_emails = len([e for e in active_manager.emails if e.get('is_active', True)])
         
         table = Table(title="Email Analytics")
         table.add_column("Metric", style="cyan")
@@ -420,26 +506,30 @@ def show_analytics():
         console.print(table)
         input("\nPress Enter to continue...")
     except Exception as e:
-        logger.error(f"Error showing analytics: {str(e)}")
+        logging.getLogger('temp_mail_cli').error(f"Error showing analytics: {str(e)}")
         console.print("[red]Failed to show analytics. Check logs for details.[/]")
 
 def export_data():
     """Export email data"""
     try:
-        if not active_manager or not active_manager.emails_data:
-            console.print("[yellow]No email data available to export.[/]")
+        format_choice = questionary.select(
+            "Select export format:",
+            choices=["json", "csv"]
+        ).ask()
+        
+        if not format_choice:
             return
             
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        filename = f"tempmail_export_{timestamp}.json"
+        # Export data using manager
+        export_file = active_manager.export_data(format=format_choice)
         
-        with open(filename, 'w') as f:
-            json.dump(active_manager.emails_data, f, indent=2)
+        if export_file:
+            console.print(f"[green]Data exported successfully to: {export_file}[/]")
+        else:
+            console.print("[red]Failed to export data[/]")
             
-        console.print(f"[green]Data exported successfully to {filename}[/]")
-        input("\nPress Enter to continue...")
     except Exception as e:
-        logger.error(f"Error exporting data: {str(e)}")
+        logging.getLogger('temp_mail_cli').error(f"Error exporting data: {str(e)}")
         console.print("[red]Failed to export data. Check logs for details.[/]")
 
 def generate_test_data():
@@ -457,202 +547,175 @@ def generate_test_data():
         
         for _ in range(int(num_emails)):
             email = f"test_{_}@example.com"
-            active_manager.emails_data.append({
-                'email': email,
-                'provider': 'Test Provider',
+            active_manager.emails[email] = {
+                'provider_class': 'Test Provider',
                 'created_at': datetime.now().isoformat(),
                 'is_active': True
-            })
+            }
         
         active_manager.save_data()
         console.print(f"[green]Successfully generated {num_emails} test emails[/]")
         input("\nPress Enter to continue...")
     except Exception as e:
-        logger.error(f"Error generating test data: {str(e)}")
+        logging.getLogger('temp_mail_cli').error(f"Error generating test data: {str(e)}")
         console.print("[red]Failed to generate test data. Check logs for details.[/]")
 
 def forward_email_menu():
-    """Handle email forwarding menu"""
-    global active_manager
-    
-    # List available emails
-    emails = [e['email'] for e in active_manager.emails_data]
-    if not emails:
-        console.print("[yellow]No emails available. Generate one first![/]")
-        return
-    
-    # Select source email
-    console.print("\n[bold cyan]Select source email:[/]")
-    source_email = select_email_to_monitor()
-    if not source_email:
-        return
-    
-    # Get messages for source email
-    messages = []
-    for email_data in active_manager.emails_data:
-        if email_data['email'] == source_email:
-            messages = email_data['messages']
-            break
-    
-    if not messages:
-        console.print("[yellow]No messages available in source email![/]")
-        return
-    
-    # Display messages
-    table = Table(title=f"Messages in {source_email}")
-    table.add_column("Index", style="cyan")
-    table.add_column("Subject", style="white")
-    table.add_column("From", style="green")
-    table.add_column("Time", style="yellow")
-    
-    for idx, msg in enumerate(messages, 1):
-        table.add_row(
-            str(idx),
-            msg['subject'],
-            msg['sender'],
-            msg['received_at']
-        )
-    
-    console.print(table)
-    
-    # Select message
-    choice = questionary.select(
-        "Select message number",
-        choices=[str(i) for i in range(1, len(messages) + 1)],
-        use_indicator=True,
-        use_shortcuts=True
-    ).ask()
-    message = messages[int(choice) - 1]
-    
-    # Select destination email
-    console.print("\n[bold cyan]Select destination email:[/]")
-    dest_email = select_email_to_monitor()
-    if not dest_email:
-        return
-    
-    # Forward the email
-    with console.status("[bold green]Forwarding email...", spinner="dots"):
-        success = active_manager.forward_email(
-            from_email=source_email,
-            to_email=dest_email,
-            message_id=message['message_id']
-        )
-    
-    if success:
-        console.print("[green]Email forwarded successfully![/]")
-    else:
-        console.print("[red]Failed to forward email![/]")
-    
-    input("\nPress Enter to continue...")
+    """Handle email forwarding menu with input validation"""
+    try:
+        # Get list of active emails
+        emails = list_emails(active_only=True)
+        if not emails:
+            console.print("[yellow]No active emails found. Generate at least two emails first.[/]")
+            return
+            
+        if len(emails) < 2:
+            console.print("[yellow]You need at least two active emails to forward messages.[/]")
+            return
+            
+        # Select source email
+        from_email = questionary.select(
+            "Select source email:",
+            choices=[e['email'] for e in emails]
+        ).ask()
+        
+        if not from_email:
+            return
+            
+        # Get messages for source email
+        try:
+            messages = active_manager.get_messages(from_email)
+            if not messages:
+                console.print("[yellow]No messages found in source email.[/]")
+                return
+                
+            # Select message to forward
+            message_choices = [
+                f"{msg.get('id', 'N/A')} - {msg.get('subject', 'No Subject')}"
+                for msg in messages
+            ]
+            
+            message_choice = questionary.select(
+                "Select message to forward:",
+                choices=message_choices
+            ).ask()
+            
+            if not message_choice:
+                return
+                
+            message_id = message_choice.split(' - ')[0]
+            
+            # Select target email
+            to_email = questionary.select(
+                "Select target email:",
+                choices=[e['email'] for e in emails if e['email'] != from_email]
+            ).ask()
+            
+            if not to_email:
+                return
+                
+            # Confirm action
+            if not Confirm.ask(f"Forward message from {from_email} to {to_email}?"):
+                return
+                
+            # Forward message
+            try:
+                with console.status("[bold blue]Forwarding message...[/]"):
+                    success = active_manager.forward_email(from_email, to_email, message_id)
+                    
+                if success:
+                    console.print("[green]Message forwarded successfully![/]")
+                else:
+                    console.print("[red]Failed to forward message.[/]")
+                    
+            except Exception as e:
+                console.print(f"[red]Error forwarding message: {str(e)}[/]")
+                
+        except Exception as e:
+            console.print(f"[red]Error getting messages: {str(e)}[/]")
+            return
+            
+    except Exception as e:
+        logging.getLogger('temp_mail_cli').error(f"Error in forward_email_menu: {str(e)}")
+        console.print("[red]An error occurred in the forwarding menu.[/]")
 
 def delete_email():
-    """Delete one or more emails"""
-    emails = active_manager.get_active_emails()
-    
-    if not emails:
-        console.print("[yellow]No active emails to delete[/]")
-        return
-        
-    # Display active emails
-    table = Table(title="Active Emails")
-    table.add_column("Index", justify="right", style="cyan")
-    table.add_column("Email", style="green")
-    table.add_column("Provider", style="blue")
-    table.add_column("Created At", style="magenta")
-    
-    for i, email_data in enumerate(emails, 1):
-        table.add_row(
-            str(i),
-            email_data['email'],
-            email_data['provider'],
-            email_data['created_at']
-        )
-    
-    console.print(table)
-    
-    # Get user selection
-    choice = Prompt.ask(
-        "Enter email numbers to delete (comma-separated, e.g., 1,2,3)",
-        default="1"
-    )
-    
+    """Delete one or more emails with proper cleanup"""
     try:
-        # Parse indices
-        indices = [int(x.strip()) - 1 for x in choice.split(",")]
+        # Get list of active emails
+        emails = list_emails(active_only=True)
+        if not emails:
+            console.print("[yellow]No active emails found.[/]")
+            return
+            
+        # Ask user what to delete
+        delete_option = questionary.select(
+            "What would you like to delete?",
+            choices=[
+                "Single email",
+                "Multiple emails",
+                "All emails",
+                "Cancel"
+            ]
+        ).ask()
+        
+        if not delete_option or delete_option == "Cancel":
+            return
+            
         emails_to_delete = []
         
-        # Validate indices
-        for idx in indices:
-            if 0 <= idx < len(emails):
-                emails_to_delete.append(emails[idx]['email'])
-            else:
-                console.print(f"[yellow]Invalid index: {idx + 1}[/]")
-        
-        if not emails_to_delete:
-            console.print("[yellow]No valid emails selected[/]")
-            return
+        if delete_option == "Single email":
+            # Select single email
+            email_choice = questionary.select(
+                "Select email to delete:",
+                choices=[e['email'] for e in emails]
+            ).ask()
             
-        # Show emails to be deleted
-        console.print("\nEmails to delete:")
-        for email in emails_to_delete:
-            console.print(f"- {email}")
-            
-        # Confirm deletion
-        if Confirm.ask("\nAre you sure you want to delete these emails?"):
-            deleted = []
-            failed = []
-            
-            for email in emails_to_delete:
-                if active_manager.delete_email(email):
-                    deleted.append(email)
-                else:
-                    failed.append(email)
-            
-            if deleted:
-                console.print(f"\n[green]Successfully deleted {len(deleted)} email(s)[/]")
-            
-            for email in failed:
-                console.print(f"\n[red]Failed to delete {email}[/]")
+            if email_choice:
+                emails_to_delete.append(email_choice)
                 
-            if not deleted and not failed:
-                console.print("\n[yellow]No emails were deleted[/]")
-        else:
-            console.print("\n[yellow]Deletion cancelled[/]")
+        elif delete_option == "Multiple emails":
+            # Select multiple emails
+            email_choices = questionary.checkbox(
+                "Select emails to delete:",
+                choices=[e['email'] for e in emails]
+            ).ask()
             
-    except ValueError:
-        console.print("[red]Please enter valid numbers[/]")
-    
-    input("\nPress Enter to continue...")
-
-def list_active_emails():
-    """List all active emails"""
-    try:
-        emails = active_manager.get_active_emails()
-        
-        if not emails:
-            console.print("[yellow]No active emails[/yellow]")
-            return
-            
-        table = Table(title="Active Emails")
-        table.add_column("Index", justify="right", style="cyan")
-        table.add_column("Email", style="green")
-        table.add_column("Provider", style="blue")
-        table.add_column("Created At", style="magenta")
-        
-        for i, email_data in enumerate(emails, 1):
-            table.add_row(
-                str(i),
-                email_data['email'],
-                email_data['provider'],
-                email_data['created_at']
-            )
-        
-        console.print(table)
-        input("\nPress Enter to continue...")
-        
+            if email_choices:
+                emails_to_delete.extend(email_choices)
+                
+        elif delete_option == "All emails":
+            # Confirm deletion of all emails
+            if Confirm.ask("Are you sure you want to delete all emails?"):
+                emails_to_delete = [e['email'] for e in emails]
+                
+        # Perform deletion with cleanup
+        if emails_to_delete:
+            try:
+                with console.status("[bold blue]Deleting emails...[/]"):
+                    for email in emails_to_delete:
+                        # Stop monitoring if active
+                        stop_monitoring(email)
+                        
+                        # Delete from provider
+                        provider = active_manager.get_provider_for_email(email)
+                        if provider:
+                            try:
+                                provider.cleanup(email)
+                            except Exception as e:
+                                logging.getLogger('temp_mail_cli').warning(f"Provider cleanup failed for {email}: {str(e)}")
+                                
+                        # Delete from manager
+                        active_manager.delete_email(email)
+                        
+                console.print(f"[green]Successfully deleted {len(emails_to_delete)} email(s)![/]")
+                
+            except Exception as e:
+                console.print(f"[red]Error during deletion: {str(e)}[/]")
+                
     except Exception as e:
-        logger.error(f"Error listing active emails: {str(e)}")
-        console.print("[red]Error listing active emails[/red]")
+        logging.getLogger('temp_mail_cli').error(f"Error in delete_email: {str(e)}")
+        console.print("[red]An error occurred while deleting emails.[/]")
 
 def handle_menu_option(option: str):
     """Handle menu option selection"""
@@ -677,14 +740,19 @@ def handle_menu_option(option: str):
         elif option == "9. Exit":
             return True  # Signal to exit
     except Exception as e:
-        logger.error(f"Error handling option {option}: {str(e)}")
+        logging.getLogger('temp_mail_cli').error(f"Error handling option {option}: {str(e)}")
         console.print(f"[red]Error:[/] {str(e)}")
     return False
 
 def main():
     """Main application entry point"""
     try:
-        # Display welcome message
+        # Initialize manager and start CLI
+        global active_manager
+        active_manager = TempMailManager()
+        
+        # Clear screen and show welcome message
+        clear_screen()
         display_welcome()
         
         while True:
@@ -702,11 +770,11 @@ def main():
             except KeyboardInterrupt:
                 break
             except Exception as e:
-                logger.error(f"Error in main loop: {str(e)}")
+                logging.getLogger('temp_mail_cli').error(f"Error in main loop: {str(e)}")
                 console.print("[red]An error occurred. Please try again.[/red]")
                 
     except Exception as e:
-        logger.error(f"Fatal error: {str(e)}")
+        logging.getLogger('temp_mail_cli').error(f"Fatal error: {str(e)}")
     finally:
         cleanup()  # This will handle the goodbye message
 

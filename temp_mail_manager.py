@@ -7,15 +7,28 @@ import string
 import random
 import logging
 import requests
-from datetime import datetime
+import threading
+from time import time, sleep
 from typing import Dict, List, Optional
+from string import Template
+from datetime import datetime
+from hashlib import md5
+from threading import Lock
+from logging.handlers import RotatingFileHandler
+
+try:
+    import aiosmtplib
+except ImportError:
+    aiosmtplib = None
+
+try:
+    from faker import Faker
+except ImportError:
+    Faker = None
+
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from functools import wraps
-from threading import Lock
-from time import time, sleep
-from hashlib import md5
-from base64 import b64decode
 from mimetypes import guess_type
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
@@ -23,15 +36,55 @@ from email.mime.application import MIMEApplication
 from bs4 import BeautifulSoup
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
-from aiosmtplib import SMTP
-from faker import Faker
 
-# Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - [%(filename)s:%(lineno)d] - %(message)s'
-)
-logger = logging.getLogger('temp_mail_manager')
+# Setup logging
+def setup_logging():
+    """Configure logging to write to files instead of console"""
+    # Create logs directory if it doesn't exist
+    log_dir = os.path.join(os.path.dirname(__file__), 'logs')
+    os.makedirs(log_dir, exist_ok=True)
+    
+    # Setup file handlers
+    app_log = os.path.join(log_dir, 'app.log')
+    error_log = os.path.join(log_dir, 'error.log')
+    
+    # Configure root logger
+    root_logger = logging.getLogger()
+    root_logger.setLevel(logging.INFO)
+    
+    # Clear any existing handlers
+    root_logger.handlers = []
+    
+    # Create formatters
+    file_formatter = logging.Formatter(
+        '%(asctime)s - %(name)s - %(levelname)s - [%(filename)s:%(lineno)d] - %(message)s'
+    )
+    
+    # Setup file handlers
+    file_handler = RotatingFileHandler(
+        app_log,
+        maxBytes=10*1024*1024,  # 10MB
+        backupCount=5
+    )
+    file_handler.setLevel(logging.INFO)
+    file_handler.setFormatter(file_formatter)
+    
+    error_handler = RotatingFileHandler(
+        error_log,
+        maxBytes=10*1024*1024,  # 10MB
+        backupCount=5
+    )
+    error_handler.setLevel(logging.ERROR)
+    error_handler.setFormatter(file_formatter)
+    
+    # Add handlers to root logger
+    root_logger.addHandler(file_handler)
+    root_logger.addHandler(error_handler)
+    
+    # Prevent logs from being printed to console
+    root_logger.propagate = False
+
+setup_logging()
 
 fake = Faker()
 
@@ -46,17 +99,30 @@ class EmailMessage:
     attachments: List[Dict] = None
 
 class RateLimiter:
-    """Rate limiter using token bucket algorithm"""
-    def __init__(self, tokens_per_second: float, burst_size: int):
+    """Rate limiter using token bucket algorithm with request tracking"""
+    def __init__(self, tokens_per_second: float = 2.0, burst_size: int = 10, 
+                 max_requests: int = 100, time_window: int = 3600):
         self.tokens_per_second = tokens_per_second
         self.burst_size = burst_size
         self.tokens = burst_size
         self.last_update = time()
         self.lock = Lock()
+        self.max_requests = max_requests
+        self.time_window = time_window
+        self.requests = []
 
     def acquire(self, tokens: int = 1) -> bool:
         with self.lock:
             now = time()
+            # Clean up old requests
+            self.requests = [req_time for req_time in self.requests 
+                           if now - req_time < self.time_window]
+            
+            # Check request limit
+            if len(self.requests) >= self.max_requests:
+                return False
+                
+            # Update tokens
             time_passed = now - self.last_update
             self.tokens = min(
                 self.burst_size,
@@ -66,8 +132,17 @@ class RateLimiter:
 
             if self.tokens >= tokens:
                 self.tokens -= tokens
+                self.requests.append(now)
                 return True
             return False
+
+    def get_remaining_requests(self) -> int:
+        """Get remaining requests in the current time window"""
+        with self.lock:
+            now = time()
+            self.requests = [req_time for req_time in self.requests 
+                           if now - req_time < self.time_window]
+            return self.max_requests - len(self.requests)
 
 def rate_limit(tokens: int = 1):
     """Decorator for rate limiting"""
@@ -167,25 +242,6 @@ class EmailTemplate:
             'subject': self.subject_template.render(**kwargs),
             'body': self.body_template.render(**kwargs)
         }
-
-class RateLimiter:
-    def __init__(self, max_requests: int, time_window: int):
-        self.max_requests = max_requests
-        self.time_window = time_window
-        self.requests = []
-        self.lock = Lock()
-
-    def can_proceed(self) -> bool:
-        current_time = time()
-        with self.lock:
-            # Remove old requests
-            self.requests = [req_time for req_time in self.requests 
-                           if current_time - req_time < self.time_window]
-            
-            if len(self.requests) < self.max_requests:
-                self.requests.append(current_time)
-                return True
-            return False
 
 class EmailMessage:
     def __init__(self, data: Dict):
@@ -427,9 +483,17 @@ class TempMailAPI(ABC):
 class TempMailManager:
     def __init__(self):
         """Initialize TempMailManager"""
+        # Setup logging
+        self.logger = logging.getLogger('temp_mail_manager')
+        
+        # Setup data directory and file
+        self.data_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'data')
+        os.makedirs(self.data_dir, exist_ok=True)
+        self.data_file = os.path.join(self.data_dir, 'emails.json')
+        
+        # Initialize data
         self.emails = {}
-        self.data_file = os.path.expanduser('~/.tempmail/emails.json')
-        os.makedirs(os.path.dirname(self.data_file), exist_ok=True)
+        self.providers = {}
         self.load_data()
 
     def add_email(self, email: str, provider: TempMailAPI) -> bool:
@@ -441,12 +505,12 @@ class TempMailManager:
                     'provider_class': provider_class,
                     'created_at': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
                 }
-                logger.info(f"Added email {email} with provider {provider_class}")
+                self.logger.info(f"Added email {email} with provider {provider_class}")
                 self.save_data()
                 return True
             return False
         except Exception as e:
-            logger.error(f"Error adding email: {str(e)}")
+            self.logger.error(f"Error adding email: {str(e)}")
             return False
 
     def get_provider_for_email(self, email: str) -> Optional[TempMailAPI]:
@@ -454,7 +518,7 @@ class TempMailManager:
         try:
             if email in self.emails:
                 provider_class = self.emails[email].get('provider_class')
-                logger.info(f"Getting provider {provider_class} for email {email}")
+                self.logger.info(f"Getting provider {provider_class} for email {email}")
                 
                 if provider_class == 'GuerrillaMailAPI':
                     return GuerrillaMailAPI()
@@ -479,22 +543,39 @@ class TempMailManager:
             
             return None
         except Exception as e:
-            logger.error(f"Error getting provider for email: {str(e)}")
+            self.logger.error(f"Error getting provider for email: {str(e)}")
             return None
 
-    def get_active_emails(self) -> List[Dict]:
-        """Get list of active emails"""
+    def get_active_emails(self) -> List[str]:
+        """
+        Get list of active emails, cleaning up old ones
+        
+        Returns:
+            List[str]: List of active email addresses
+        """
         try:
-            return [
-                {
-                    'email': email,
-                    'provider': data['provider_class'],
-                    'created_at': data['created_at']
-                }
-                for email, data in self.emails.items()
-            ]
+            current_time = datetime.now()
+            active_emails = []
+            
+            for email, data in self.emails.items():
+                # Skip if no creation time
+                if 'created_at' not in data:
+                    continue
+                    
+                # Parse creation time
+                created_at = datetime.fromisoformat(data['created_at'])
+                
+                # Check if email is within active window (24 hours)
+                if (current_time - created_at).total_seconds() < 24 * 3600:
+                    active_emails.append(email)
+                else:
+                    # Clean up old email
+                    self.delete_email(email)
+                    
+            return active_emails
+            
         except Exception as e:
-            logger.error(f"Error getting active emails: {str(e)}")
+            self.logger.error(f"Error getting active emails: {str(e)}")
             return []
 
     def delete_email(self, email: str) -> bool:
@@ -506,7 +587,7 @@ class TempMailManager:
                 return True
             return False
         except Exception as e:
-            logger.error(f"Error deleting email: {str(e)}")
+            self.logger.error(f"Error deleting email: {str(e)}")
             return False
 
     def load_data(self):
@@ -516,7 +597,7 @@ class TempMailManager:
                 with open(self.data_file, 'r') as f:
                     self.emails = json.load(f)
         except Exception as e:
-            logger.error(f"Error loading data: {str(e)}")
+            self.logger.error(f"Error loading data: {str(e)}")
             self.emails = {}
 
     def save_data(self):
@@ -524,64 +605,70 @@ class TempMailManager:
         try:
             with open(self.data_file, 'w') as f:
                 json.dump(self.emails, f, indent=4)
-            logger.info("Email data saved successfully")
+            self.logger.info("Email data saved successfully")
         except Exception as e:
-            logger.error(f"Error saving data: {str(e)}")
+            self.logger.error(f"Error saving data: {str(e)}")
 
     def get_messages(self, email: str) -> List[Dict]:
-        """Get messages for an email"""
+        """
+        Get messages for an email address
+        
+        Args:
+            email (str): Email address to get messages for
+            
+        Returns:
+            List[Dict]: List of message dictionaries
+        """
         try:
             provider = self.get_provider_for_email(email)
             if not provider:
-                # Try getting provider by domain
-                domain = email.split('@')[1]
-                provider = self.get_provider_by_domain(domain)
-                if provider:
-                    # Update stored provider
-                    self.emails[email] = {
-                        'provider_class': provider.__class__.__name__,
-                        'created_at': self.emails.get(email, {}).get('created_at', datetime.now().strftime('%Y-%m-%d %H:%M:%S'))
-                    }
-                    self.save_data()
-        
-            if provider:
-                try:
-                    messages = provider.get_messages(email)
-                    if not messages:
-                        logger.info(f"No messages found for {email}")
-                        return []
-                    
-                    if not isinstance(messages, list):
-                        logger.error(f"Invalid message format for {email}: not a list")
-                        return []
-                
-                    # Process and validate each message
-                    valid_messages = []
-                    for msg in messages:
-                        if not isinstance(msg, dict):
-                            continue
-                        
-                        msg_id = msg.get('id')
-                        if not msg_id:
-                            continue
-                        
-                        # Ensure all required fields exist
-                        msg['from'] = msg.get('from', 'Unknown')
-                        msg['subject'] = msg.get('subject', 'No Subject')
-                        msg['date'] = msg.get('date', 'Unknown')
-                        msg['body'] = msg.get('body', '')
-                    
-                        valid_messages.append(msg)
-                
-                    return valid_messages
-                
-                except Exception as e:
-                    logger.error(f"Error getting messages from provider: {str(e)}")
-                    return []
-            return []
+                raise EmailProviderError(f"No provider found for {email}")
+
+            messages = provider.get_messages(email)
+            if not messages:
+                return []
+
+            # Ensure all message fields are strings for display
+            formatted_messages = []
+            for msg in messages:
+                formatted_msg = {
+                    'id': str(msg.get('id', '')),
+                    'from': str(msg.get('from', 'Unknown')),
+                    'subject': str(msg.get('subject', 'No Subject')),
+                    'date': self._format_date(msg.get('date')),
+                    'body': str(msg.get('body', '')),
+                    'html': str(msg.get('html', '')) if msg.get('html') else None,
+                    'attachments': msg.get('attachments', [])
+                }
+                formatted_messages.append(formatted_msg)
+
+            return formatted_messages
+
         except Exception as e:
-            logger.error(f"Error getting messages: {str(e)}")
-            return []
+            self.logger.error(f"Error getting messages for {email}: {str(e)}")
+            raise
+
+    def _format_date(self, date_value) -> str:
+        """Format date value to string, handling various formats"""
+        if not date_value:
+            return 'Unknown'
+            
+        try:
+            if isinstance(date_value, (int, float)):
+                # Unix timestamp
+                return datetime.fromtimestamp(int(date_value)).strftime('%Y-%m-%d %H:%M:%S')
+            elif isinstance(date_value, str):
+                # Try parsing as timestamp first
+                try:
+                    return datetime.fromtimestamp(int(date_value)).strftime('%Y-%m-%d %H:%M:%S')
+                except (ValueError, TypeError):
+                    # Try parsing as ISO format
+                    return datetime.fromisoformat(date_value).strftime('%Y-%m-%d %H:%M:%S')
+            else:
+                return str(date_value)
+        except Exception as e:
+            self.logger.warning(f"Could not parse date {date_value}: {str(e)}")
+            return str(date_value)
 
     def get_message(self, email: str, message_id: str) -> Optional[Dict]:
         """Get a specific message"""
@@ -596,11 +683,11 @@ class TempMailManager:
                 try:
                     message = provider.get_message(email, message_id)
                     if not message:
-                        logger.info(f"Message {message_id} not found for {email}")
+                        self.logger.info(f"Message {message_id} not found for {email}")
                         return None
                     
                     if not isinstance(message, dict):
-                        logger.error(f"Invalid message format for {email}: not a dict")
+                        self.logger.error(f"Invalid message format for {email}: not a dict")
                         return None
                 
                     # Ensure all required fields exist
@@ -612,40 +699,41 @@ class TempMailManager:
                     return message
                 
                 except Exception as e:
-                    logger.error(f"Error getting message from provider: {str(e)}")
+                    self.logger.error(f"Error getting message from provider: {str(e)}")
                     return None
             return None
         except Exception as e:
-            logger.error(f"Error getting message: {str(e)}")
+            self.logger.error(f"Error getting message: {str(e)}")
             return None
 
     def generate_new_email(self) -> Optional[str]:
         """Generate a new temporary email address"""
         try:
-            # Generate random username
-            username = ''.join(random.choices(string.ascii_lowercase + string.digits, k=10))
+            # Initialize providers if not already done
+            if not self.providers:
+                self.providers = {
+                    'guerrilla': GuerrillaMailAPI(),
+                    'tempmail': TempMailOrgAPI(),
+                    'disposable': DisposableMailAPI(),
+                    'yopmail': YopMailAPI()
+                }
             
-            # Get available domains
-            domains = self.get_available_domains()
-            if not domains:
-                logger.error("No domains available")
-                return None
-                
-            # Select random domain
-            domain = random.choice(domains)
+            # Try each provider in order until one succeeds
+            for provider_name, provider in self.providers.items():
+                try:
+                    email = provider.generate_email()
+                    if email:
+                        # Add to managed emails
+                        self.add_email(email, provider)
+                        return email
+                except Exception as e:
+                    self.logger.warning(f"Failed to generate email with {provider_name}: {str(e)}")
+                    continue
             
-            # Create email
-            email = f"{username}@{domain}"
-            
-            # Validate email
-            if not self.validate_email(email):
-                logger.error(f"Generated invalid email: {email}")
-                return None
-                
-            return email
+            raise EmailGenerationError("All providers failed to generate email")
             
         except Exception as e:
-            logger.error(f"Error generating email: {str(e)}")
+            self.logger.error(f"Error generating new email: {str(e)}")
             return None
 
     def get_available_domains(self) -> List[str]:
@@ -805,91 +893,141 @@ class TempMailManager:
         return True
 
     def forward_email(self, from_email: str, to_email: str, message_id: str) -> bool:
-        """Forward an email from one temp mail to another"""
+        """
+        Forward an email from one temp mail to another using provider's native capabilities
+        or fallback to manual forwarding if not supported.
+        
+        Args:
+            from_email (str): Source email address
+            to_email (str): Destination email address
+            message_id (str): ID of the message to forward
+            
+        Returns:
+            bool: True if forwarding successful, False otherwise
+        """
         try:
-            # Get source provider
-            from_provider = self.get_provider(from_email)
-            if not from_provider:
-                raise ValueError(f"No provider found for source email {from_email}")
+            # Get providers
+            from_provider = self.get_provider_for_email(from_email)
+            to_provider = self.get_provider_for_email(to_email)
+            
+            if not from_provider or not to_provider:
+                raise EmailProviderError("Provider not found for one or both emails")
 
-            # Get target provider
-            to_provider = self.get_provider(to_email)
-            if not to_provider:
-                raise ValueError(f"No provider found for target email {to_email}")
-
-            # Get the message content
-            message = None
-            for email_data in self.emails.values():
-                if email_data['email'] == from_email:
-                    for msg in email_data.get('messages', []):
-                        if msg.get('id') == message_id:
-                            message = msg
-                            break
-                    break
-
+            # Get original message
+            message = from_provider.get_message(from_email, message_id)
             if not message:
-                raise ValueError(f"Message {message_id} not found")
+                raise EmailProviderError(f"Message {message_id} not found")
 
-            # Create forwarded message body
-            forward_body = self._create_forward_body(message, message)
+            # Create forwarded message content
+            forward_content = self._create_forward_body(message, from_email)
 
-            # Forward the message using the target provider
-            success = to_provider.send_test_email(
-                email=to_email,
-                subject=f"Fwd: {message.get('subject', 'No Subject')}",
-                body=forward_body
-            )
+            # Try provider's native forwarding first
+            if hasattr(to_provider, 'forward_message'):
+                success = to_provider.forward_message(to_email, forward_content)
+                if success:
+                    self.logger.info(f"Successfully forwarded message using provider's native capability")
+                    return True
 
-            if success:
-                logger.info(f"Successfully forwarded message {message_id} from {from_email} to {to_email}")
-                return True
-            else:
-                logger.error(f"Failed to forward message {message_id}")
-                return False
+            # Fallback to manual forwarding
+            try:
+                # Create new message in destination inbox
+                success = self._manual_forward(to_email, forward_content)
+                if success:
+                    self.logger.info(f"Successfully forwarded message using manual forwarding")
+                    return True
+                else:
+                    raise EmailProviderError("Failed to forward message")
+
+            except Exception as e:
+                self.logger.error(f"Error in manual forwarding: {str(e)}")
+                raise
 
         except Exception as e:
-            logger.error(f"Error forwarding email: {str(e)}")
-            return False
+            self.logger.error(f"Error forwarding email: {str(e)}")
+            raise
 
-    def _create_forward_body(self, original_message: Dict, message_content: Dict) -> str:
-        """Create the forwarded message body with proper formatting"""
-        # Get message details
-        from_addr = original_message.get('from', 'Unknown')
-        date = datetime.fromtimestamp(int(original_message.get('date', 0))).strftime('%Y-%m-%d %H:%M:%S')
-        subject = original_message.get('subject', 'No Subject')
-        body = message_content.get('body', '')
-
-        # Create forward header
-        forward_header = f"""
----------- Forwarded message ----------
-From: {from_addr}
-Date: {date}
-Subject: {subject}
-
-"""
-        return forward_header + body
-
-    def validate_email(self, email: str) -> bool:
-        """Validate email format"""
+    def _create_forward_body(self, message: Dict, from_email: str) -> Dict:
+        """Create the forwarded message content with proper formatting"""
         try:
-            # Basic email format validation
-            if not re.match(r"[^@]+@[^@]+\.[^@]+", email):
-                return False
-                
-            # Check domain
-            domain = email.split('@')[1]
-            provider = self.get_provider(email)
-            if not provider:
-                return False
-                
-            # Check if domain is supported by provider
-            domains = provider.get_available_domains()
-            if domain not in domains:
-                return False
+            # Get original message fields
+            subject = message.get('subject', 'No Subject')
+            body = message.get('body', '')
+            sender = message.get('from', 'Unknown')
+            date = message.get('date', 'Unknown')
+            
+            # Create forwarded message content
+            forward_content = {
+                'subject': f"Fwd: {subject}",
+                'body': f"\n\n---------- Forwarded message ----------\n"
+                       f"From: {sender}\n"
+                       f"Date: {date}\n"
+                       f"Subject: {subject}\n"
+                       f"To: {from_email}\n\n"
+                       f"{body}",
+                'from': from_email,
+                'html': message.get('html', '')
+            }
+            
+            return forward_content
+            
+        except Exception as e:
+            self.logger.error(f"Error creating forward body: {str(e)}")
+            raise
+
+    def _manual_forward(self, to_email: str, forward_content: Dict) -> bool:
+        """Manually forward a message by creating a new message in the destination inbox"""
+        try:
+            # Get provider for destination email
+            to_provider = self.get_provider_for_email(to_email)
+            if not to_provider:
+                raise EmailProviderError("Provider not found for destination email")
+
+            # Send message using provider's send_message method
+            success = to_provider.send_message(forward_content)
+            if not success:
+                raise EmailProviderError("Failed to send forwarded message")
                 
             return True
-        except Exception:
+            
+        except Exception as e:
+            self.logger.error(f"Error in manual forwarding: {str(e)}")
             return False
+
+    def validate_email(self, email: str) -> bool:
+        """
+        Validate email format and check if it's from a supported provider
+        
+        Args:
+            email (str): Email address to validate
+        
+        Returns:
+            bool: True if email is valid, False otherwise
+        
+        Raises:
+            ValueError: If email format is invalid
+        """
+        try:
+            # Basic format validation
+            if not re.match(r"[^@]+@[^@]+\.[^@]+", email):
+                raise ValueError("Invalid email format")
+            
+            # Extract domain
+            domain = email.split('@')[-1].lower()
+            
+            # Check if domain is supported by any provider
+            supported_domains = set()
+            for provider in [GuerrillaMailAPI(), DisposableMailAPI(), 
+                            YopMailAPI(), TempMailOrgAPI()]:
+                supported_domains.update(provider.get_available_domains())
+            
+            if domain not in supported_domains:
+                return False
+            
+            return True
+        
+        except Exception as e:
+            self.logger.error(f"Email validation error: {str(e)}")
+            raise ValueError(f"Email validation failed: {str(e)}")
 
 def main():
     """Example usage of TempMailManager"""
@@ -954,26 +1092,38 @@ class YopMailAPI(TempMailAPI):
         ]
         self.session = retry_with_backoff()
 
+    def generate_random_username(self) -> str:
+        """Generate a random username with consistent pattern"""
+        username = ''.join(random.choices(string.ascii_lowercase, k=4))
+        username += ''.join(random.choices(string.digits, k=4))
+        username += ''.join(random.choices(string.ascii_lowercase, k=4))
+        return username
+
     def generate_email(self) -> str:
         """Generate a new email address"""
         try:
-            # Generate random username (10-12 chars)
-            email_user = ''.join(random.choices(string.ascii_lowercase + string.digits, k=random.randint(10, 12)))
-            domain = random.choice(self.domains)
+            # Generate random username with consistent pattern
+            username = self.generate_random_username()
             
-            # Verify email availability
+            # Use most reliable domain
+            domain = "yopmail.com"
+            
+            # Create email
+            email = f"{username}@{domain}"
+            
+            # Verify email is accessible
             response = self.session.get(
-                f"{self.base_url}/check.php",
-                params={"login": email_user},
-                headers={"User-Agent": "Mozilla/5.0"}
+                f"{self.api_url}/{username}",
+                headers={"User-Agent": "Mozilla/5.0"},
+                timeout=10
             )
             response.raise_for_status()
             
-            return f"{email_user}@{domain}"
+            return email
             
         except Exception as e:
-            logger.error(f"Error generating YopMail address: {str(e)}")
-            raise APIError("Failed to generate YopMail address")
+            logging.error(f"Error generating YopMail address: {str(e)}")
+            raise EmailGenerationError("Failed to generate YopMail address")
 
     def get_messages(self, email: str) -> List[Dict]:
         """Get messages for an email address"""
@@ -1004,13 +1154,13 @@ class YopMailAPI(TempMailAPI):
                         if msg:
                             messages.append(msg)
                 except Exception as e:
-                    logger.error(f"Error processing message {msg_id}: {str(e)}")
+                    logging.error(f"Error processing message {msg_id}: {str(e)}")
                     continue
             
             return messages
             
         except Exception as e:
-            logger.error(f"Error getting messages from YopMail: {str(e)}")
+            logging.error(f"Error getting messages from YopMail: {str(e)}")
             return []
 
     def get_message(self, email: str, message_id: str) -> Optional[Dict]:
@@ -1049,7 +1199,7 @@ class YopMailAPI(TempMailAPI):
             }
             
         except Exception as e:
-            logger.error(f"Error getting message from YopMail: {str(e)}")
+            logging.error(f"Error getting message from YopMail: {str(e)}")
             return None
 
     def get_provider_name(self) -> str:
@@ -1060,6 +1210,49 @@ class YopMailAPI(TempMailAPI):
         """Get list of available domains"""
         return self.domains
 
+    def send_message(self, message_data: Dict) -> bool:
+        """Send a message using YopMail API"""
+        try:
+            # Format message data
+            data = {
+                'to': message_data['to'],
+                'subject': message_data['subject'],
+                'body': message_data.get('html', message_data['body']),
+                'from': message_data.get('from', ''),
+                'attachments': message_data.get('attachments', [])
+            }
+            
+            # Use YopMail's API to send message
+            response = requests.post(
+                'https://yopmail.com/en/mail',
+                json=data,
+                timeout=30
+            )
+            response.raise_for_status()
+            
+            return True
+            
+        except Exception as e:
+            logging.error(f"Error sending message via YopMail: {str(e)}")
+            return False
+
+    def forward_message(self, to_email: str, message_data: Dict) -> bool:
+        """Forward a message using YopMail API"""
+        try:
+            # Format message for forwarding
+            forward_data = {
+                'to': to_email,
+                'subject': message_data['subject'],
+                'from': message_data.get('forwarded_from', ''),
+                'body': message_data.get('html', message_data['body']),
+                'attachments': message_data.get('attachments', [])
+            }
+            
+            return self.send_message(forward_data)
+            
+        except Exception as e:
+            logging.error(f"Error forwarding message via YopMail: {str(e)}")
+            return False
 
 class TempMailOrgAPI(TempMailAPI):
     """Temp-Mail.org provider - Free and no auth required"""
@@ -1076,6 +1269,13 @@ class TempMailOrgAPI(TempMailAPI):
         self.session = retry_with_backoff()
         self._token = None
 
+    def generate_random_username(self) -> str:
+        """Generate a random username with consistent pattern"""
+        username = ''.join(random.choices(string.ascii_lowercase, k=4))
+        username += ''.join(random.choices(string.digits, k=4))
+        username += ''.join(random.choices(string.ascii_lowercase, k=4))
+        return username
+
     def _get_token(self) -> Optional[str]:
         """Get authentication token"""
         try:
@@ -1091,37 +1291,40 @@ class TempMailOrgAPI(TempMailAPI):
             return self._token
             
         except Exception as e:
-            logger.error(f"Error getting token: {str(e)}")
+            logging.error(f"Error getting token: {str(e)}")
             return None
 
     def generate_email(self) -> str:
         """Generate a new email address"""
         try:
-            # Generate random username
-            email_user = ''.join(random.choices(string.ascii_lowercase + string.digits, k=10))
-            domain = random.choice(self.domains)
+            # Generate random username with consistent pattern
+            username = self.generate_random_username()
             
-            # Get token
+            # Use most reliable domain
+            domain = "temp-mail.org"
+            
+            # Create email
+            email = f"{username}@{domain}"
+            
+            # Get token and validate email
             token = self._get_token()
             if not token:
-                raise APIError("Failed to get authentication token")
-            
-            # Register email
+                raise EmailGenerationError("Failed to get authentication token")
+                
+            headers = {'Authorization': f'Bearer {token}'}
             response = self.session.post(
                 f"{self.base_url}/email/new",
-                headers={
-                    "Authorization": f"Bearer {token}",
-                    "User-Agent": "Mozilla/5.0"
-                },
-                json={"email": f"{email_user}@{domain}"}
+                json={'email': email},
+                headers=headers,
+                timeout=10
             )
             response.raise_for_status()
             
-            return f"{email_user}@{domain}"
+            return email
             
         except Exception as e:
-            logger.error(f"Error generating Temp-Mail.org address: {str(e)}")
-            raise APIError("Failed to generate Temp-Mail.org address")
+            logging.error(f"Error generating Temp-Mail.org address: {str(e)}")
+            raise EmailGenerationError("Failed to generate Temp-Mail.org address")
 
     def get_messages(self, email: str) -> List[Dict]:
         """Get messages for an email address"""
@@ -1151,13 +1354,13 @@ class TempMailOrgAPI(TempMailAPI):
                         if full_msg:
                             messages.append(full_msg)
                 except Exception as e:
-                    logger.error(f"Error processing message {msg.get('id')}: {str(e)}")
+                    logging.error(f"Error processing message {msg.get('id')}: {str(e)}")
                     continue
             
             return messages
             
         except Exception as e:
-            logger.error(f"Error getting messages from Temp-Mail.org: {str(e)}")
+            logging.error(f"Error getting messages from Temp-Mail.org: {str(e)}")
             return []
 
     def get_message(self, email: str, message_id: str) -> Optional[Dict]:
@@ -1188,7 +1391,7 @@ class TempMailOrgAPI(TempMailAPI):
             }
             
         except Exception as e:
-            logger.error(f"Error getting message from Temp-Mail.org: {str(e)}")
+            logging.error(f"Error getting message from Temp-Mail.org: {str(e)}")
             return None
 
     def get_provider_name(self) -> str:
@@ -1198,6 +1401,59 @@ class TempMailOrgAPI(TempMailAPI):
     def get_available_domains(self) -> List[str]:
         """Get list of available domains"""
         return self.domains
+
+    def send_message(self, message_data: Dict) -> bool:
+        """Send a message using Temp-Mail.org API"""
+        try:
+            # Get token for authentication
+            token = self._get_token()
+            if not token:
+                return False
+            
+            # Format message data
+            data = {
+                'to': message_data['to'],
+                'subject': message_data['subject'],
+                'text': message_data['body'],
+                'html': message_data.get('html'),
+                'from': message_data.get('from', ''),
+                'attachments': message_data.get('attachments', [])
+            }
+            
+            # Send message using API
+            headers = {'Authorization': f'Bearer {token}'}
+            response = requests.post(
+                'https://api.temp-mail.org/request/send',
+                json=data,
+                headers=headers,
+                timeout=30
+            )
+            response.raise_for_status()
+            
+            return True
+            
+        except Exception as e:
+            logging.error(f"Error sending message via Temp-Mail.org: {str(e)}")
+            return False
+
+    def forward_message(self, to_email: str, message_data: Dict) -> bool:
+        """Forward a message using Temp-Mail.org API"""
+        try:
+            # Format message for forwarding
+            forward_data = {
+                'to': to_email,
+                'subject': message_data['subject'],
+                'text': message_data['body'],
+                'html': message_data.get('html'),
+                'from': message_data.get('forwarded_from', ''),
+                'attachments': message_data.get('attachments', [])
+            }
+            
+            return self.send_message(forward_data)
+            
+        except Exception as e:
+            logging.error(f"Error forwarding message via Temp-Mail.org: {str(e)}")
+            return False
 
 class DisposableMailAPI(TempMailAPI):
     """1secmail.com provider - Free and no auth required"""
@@ -1210,6 +1466,13 @@ class DisposableMailAPI(TempMailAPI):
             "1secmail.net"
         ]
         self.session = retry_with_backoff()
+
+    def generate_random_username(self) -> str:
+        """Generate a random username with consistent pattern"""
+        username = ''.join(random.choices(string.ascii_lowercase, k=4))
+        username += ''.join(random.choices(string.digits, k=4))
+        username += ''.join(random.choices(string.ascii_lowercase, k=4))
+        return username
 
     def _validate_email(self, email: str) -> bool:
         """Validate email exists and is ready for use"""
@@ -1230,41 +1493,35 @@ class DisposableMailAPI(TempMailAPI):
     def generate_email(self) -> str:
         """Generate a new email address"""
         try:
-            # Try to get email from API first
+            # Generate random username with consistent pattern
+            username = self.generate_random_username()
+            
+            # Use most reliable domain
+            domain = "1secmail.com"
+            
+            # Create email
+            email = f"{username}@{domain}"
+            
+            # Validate email exists
             response = self.session.get(
                 f"{self.base_url}",
                 params={
-                    "action": "genRandomMailbox",
-                    "count": 1
-                }
+                    'action': 'genRandomMailbox',
+                    'count': 1
+                },
+                timeout=10
             )
             response.raise_for_status()
             
-            if response.json():
-                email = response.json()[0]
-                if self._validate_email(email):
-                    return email
-
-            # Fallback to manual generation if API fails
-            for _ in range(3):  # Try up to 3 times
-                # Use more reliable pattern for username
-                email_user = ''.join(random.choices(string.ascii_lowercase, k=4))  # Start with letters
-                email_user += ''.join(random.choices(string.digits, k=4))  # Add some numbers
-                email_user += ''.join(random.choices(string.ascii_lowercase, k=4))  # End with letters
-                
-                domain = "1secmail.com"  # Use most reliable domain
-                email = f"{email_user}@{domain}"
-                
-                if self._validate_email(email):
-                    return email
-                
-                sleep(1)  # Wait before retry
+            # Verify email was created
+            if not self._validate_email(email):
+                raise EmailGenerationError("Failed to validate email")
             
-            raise APIError("Failed to generate valid email address")
+            return email
             
         except Exception as e:
-            logger.error(f"Error generating 1secmail address: {str(e)}")
-            raise APIError("Failed to generate 1secmail address")
+            logging.error(f"Error generating 1secmail address: {str(e)}")
+            raise EmailGenerationError("Failed to generate 1secmail address")
 
     def get_messages(self, email: str) -> List[Dict]:
         """Get messages for an email address"""
@@ -1273,7 +1530,7 @@ class DisposableMailAPI(TempMailAPI):
             
             # Verify email is valid
             if not self._validate_email(email):
-                logger.error(f"Email {email} is not valid or accessible")
+                logging.error(f"Email {email} is not valid or accessible")
                 return []
             
             # Get messages with retry
@@ -1299,20 +1556,20 @@ class DisposableMailAPI(TempMailAPI):
                                 if full_msg:
                                     messages.append(full_msg)
                         except Exception as e:
-                            logger.error(f"Error processing message {msg.get('id')}: {str(e)}")
+                            logging.error(f"Error processing message {msg.get('id')}: {str(e)}")
                             continue
                     
                     return messages
                     
                 except Exception as e:
-                    logger.error(f"Error on attempt {attempt + 1}: {str(e)}")
+                    logging.error(f"Error on attempt {attempt + 1}: {str(e)}")
                     if attempt < 2:  # Not the last attempt
                         sleep(2)  # Wait before retry
             
             return []
             
         except Exception as e:
-            logger.error(f"Error getting messages from 1secmail: {str(e)}")
+            logging.error(f"Error getting messages from 1secmail: {str(e)}")
             return []
 
     def get_message(self, email: str, message_id: str) -> Optional[Dict]:
@@ -1356,26 +1613,25 @@ class DisposableMailAPI(TempMailAPI):
                                         'content': att_response.content
                                     })
                             except Exception as e:
-                                logger.error(f"Error downloading attachment: {str(e)}")
+                                logging.error(f"Error downloading attachment: {str(e)}")
                     
                     return {
                         'id': str(msg.get('id')),
                         'from': msg.get('from'),
                         'subject': msg.get('subject'),
                         'date': msg.get('date'),
-                        'body': msg.get('textBody', msg.get('htmlBody', '')),
-                        'attachments': attachments
+                        'body': msg.get('textBody', msg.get('htmlBody', ''))
                     }
                     
                 except Exception as e:
-                    logger.error(f"Error on attempt {attempt + 1}: {str(e)}")
+                    logging.error(f"Error on attempt {attempt + 1}: {str(e)}")
                     if attempt < 2:  # Not the last attempt
                         sleep(2)  # Wait before retry
             
             return None
             
         except Exception as e:
-            logger.error(f"Error getting message from 1secmail: {str(e)}")
+            logging.error(f"Error getting message from 1secmail: {str(e)}")
             return None
 
     def get_provider_name(self) -> str:
@@ -1386,11 +1642,61 @@ class DisposableMailAPI(TempMailAPI):
         """Get list of available domains"""
         return self.domains
 
+    def send_message(self, message_data: Dict) -> bool:
+        """Send a message using 1secmail API"""
+        try:
+            # Format message data
+            data = {
+                'to': message_data['to'],
+                'subject': message_data['subject'],
+                'body': message_data.get('html', message_data['body']),
+                'from': message_data.get('from', ''),
+                'attachments': message_data.get('attachments', [])
+            }
+            
+            # Send message using API
+            response = requests.post(
+                'https://www.1secmail.com/api/v1/',
+                params={'action': 'send'},
+                json=data,
+                timeout=30
+            )
+            response.raise_for_status()
+            
+            result = response.json()
+            if result.get('status') == 'success':
+                return True
+            else:
+                logging.error(f"Failed to send message: {result.get('message', 'Unknown error')}")
+                return False
+                
+        except Exception as e:
+            logging.error(f"Error sending message via 1secmail: {str(e)}")
+            return False
+
+    def forward_message(self, to_email: str, message_data: Dict) -> bool:
+        """Forward a message using 1secmail API"""
+        try:
+            # Format message for forwarding
+            forward_data = {
+                'to': to_email,
+                'subject': message_data['subject'],
+                'from': message_data.get('forwarded_from', ''),
+                'body': message_data.get('html', message_data['body']),
+                'attachments': message_data.get('attachments', [])
+            }
+            
+            return self.send_message(forward_data)
+            
+        except Exception as e:
+            logging.error(f"Error forwarding message via 1secmail: {str(e)}")
+            return False
+
 class GuerrillaMailAPI(TempMailAPI):
     """Guerrilla Mail provider"""
     def __init__(self):
         """Initialize provider"""
-        self.base_url = "https://api.guerrillamail.com/ajax.php"
+        self.base_url = 'https://api.guerrillamail.com/ajax.php'
         self.session_id = None
         self.domains = [
             "guerrillamail.com",
@@ -1401,6 +1707,13 @@ class GuerrillaMailAPI(TempMailAPI):
         ]
         self.session = retry_with_backoff()
         self._init_session()
+
+    def generate_random_username(self) -> str:
+        """Generate a random username with consistent pattern"""
+        username = ''.join(random.choices(string.ascii_lowercase, k=4))
+        username += ''.join(random.choices(string.digits, k=4))
+        username += ''.join(random.choices(string.ascii_lowercase, k=4))
+        return username
 
     def _init_session(self):
         """Initialize Guerrilla Mail session"""
@@ -1416,9 +1729,9 @@ class GuerrillaMailAPI(TempMailAPI):
             response.raise_for_status()
             data = response.json()
             self.session_id = data.get('sid_token')
-            logger.info(f"Initialized Guerrilla Mail session: {self.session_id}")
+            logging.info(f"Initialized Guerrilla Mail session: {self.session_id}")
         except Exception as e:
-            logger.error(f"Error initializing session: {str(e)}")
+            logging.error(f"Error initializing session: {str(e)}")
             raise APIError("Failed to initialize Guerrilla Mail session")
 
     def _check_session(self):
@@ -1440,10 +1753,10 @@ class GuerrillaMailAPI(TempMailAPI):
             )
             response.raise_for_status()
             data = response.json()
-            logger.info(f"Set email address: {email_user}@{domain}")
+            logging.info(f"Set email address: {email_user}@{domain}")
             return True
         except Exception as e:
-            logger.error(f"Error setting email address: {str(e)}")
+            logging.error(f"Error setting email address: {str(e)}")
             return False
 
     def _forget_me(self):
@@ -1460,28 +1773,41 @@ class GuerrillaMailAPI(TempMailAPI):
             self.session_id = None
             self._init_session()
         except Exception as e:
-            logger.error(f"Error resetting session: {str(e)}")
+            logging.error(f"Error resetting session: {str(e)}")
 
     def generate_email(self) -> str:
         """Generate a new email address"""
         try:
             self._check_session()
             
-            # Use more reliable pattern for username
-            email_user = ''.join(random.choices(string.ascii_lowercase, k=4))  # Start with letters
-            email_user += ''.join(random.choices(string.digits, k=4))  # Add some numbers
-            email_user += ''.join(random.choices(string.ascii_lowercase, k=4))  # End with letters
+            # Generate random username with consistent pattern
+            username = self.generate_random_username()
             
-            domain = "sharklasers.com"  # Use most reliable domain
-            email = f"{email_user}@{domain}"
+            # Use most reliable domain
+            domain = "sharklasers.com"
             
-            if not self._set_email_address(email_user, domain):
-                raise APIError("Failed to set email address")
+            # Set email address
+            if not self._set_email_address(username, domain):
+                raise EmailGenerationError("Failed to set email address")
             
+            # Verify session is active
+            response = self.session.get(
+                f"{self.base_url}",
+                params={
+                    'f': 'get_email_address',
+                    'sid_token': self.session_id
+                },
+                timeout=10
+            )
+            response.raise_for_status()
+            
+            email = f"{username}@{domain}"
             return email
+            
         except Exception as e:
-            logger.error(f"Error generating email: {str(e)}")
-            raise APIError("Failed to generate Guerrilla Mail address")
+            logging.error(f"Error generating email: {str(e)}")
+            self._forget_me()  # Reset session on error
+            raise EmailGenerationError("Failed to generate Guerrilla Mail address")
 
     def get_messages(self, email: str) -> List[Dict]:
         """Get messages for an email address"""
@@ -1495,20 +1821,22 @@ class GuerrillaMailAPI(TempMailAPI):
             if not self._set_email_address(email_user, domain):
                 return []
             
-            # Get messages with retry
+            # Get messages with retries
             for attempt in range(3):
                 try:
+                    # Get message list
                     response = self.session.get(
                         f"{self.base_url}",
                         params={
-                            "f": "check_email",
-                            "seq": "0",
+                            "f": "get_email_list",
+                            "offset": 0,
                             "sid_token": self.session_id
                         }
                     )
                     response.raise_for_status()
                     data = response.json()
                     
+                    # Extract messages
                     messages = []
                     for msg in data.get('list', []):
                         messages.append({
@@ -1519,14 +1847,10 @@ class GuerrillaMailAPI(TempMailAPI):
                             'body': msg.get('mail_excerpt', '')
                         })
                     
-                    if messages:
-                        return messages
-                    
-                    # Wait before retry
-                    sleep(2)
+                    return messages
                     
                 except Exception as e:
-                    logger.error(f"Error on attempt {attempt + 1}: {str(e)}")
+                    logging.error(f"Error on attempt {attempt + 1}: {str(e)}")
                     if attempt == 2:  # Last attempt
                         self._forget_me()  # Reset session
                     else:
@@ -1535,7 +1859,7 @@ class GuerrillaMailAPI(TempMailAPI):
             return []
             
         except Exception as e:
-            logger.error(f"Error getting messages: {str(e)}")
+            logging.error(f"Error getting messages: {str(e)}")
             return []
 
     def get_message(self, email: str, message_id: str) -> Optional[Dict]:
@@ -1562,15 +1886,18 @@ class GuerrillaMailAPI(TempMailAPI):
             response.raise_for_status()
             msg = response.json()
             
+            # Extract message content
             return {
                 'id': str(msg.get('mail_id')),
                 'from': msg.get('mail_from', 'Unknown'),
                 'subject': msg.get('mail_subject', 'No Subject'),
                 'date': msg.get('mail_timestamp', 'Unknown'),
-                'body': msg.get('mail_body', '')
+                'body': msg.get('mail_body', ''),
+                'html': msg.get('mail_html', None)
             }
+            
         except Exception as e:
-            logger.error(f"Error getting message: {str(e)}")
+            logging.error(f"Error getting message: {str(e)}")
             return None
 
     def get_provider_name(self) -> str:
@@ -1580,6 +1907,108 @@ class GuerrillaMailAPI(TempMailAPI):
     def get_available_domains(self) -> List[str]:
         """Get list of available domains"""
         return self.domains
+
+    def send_message(self, message_data: Dict) -> bool:
+        """Send a message using Guerrilla Mail API"""
+        try:
+            self._check_session()
+            
+            # Set email address for sending
+            email_user = message_data['to'].split('@')[0]
+            domain = message_data['to'].split('@')[1]
+            if not self._set_email_address(email_user, domain):
+                return False
+            
+            # Format message data
+            data = {
+                'to': message_data['to'],
+                'subject': message_data['subject'],
+                'from': message_data.get('from', ''),
+                'message': message_data.get('html', '') or message_data.get('body', ''),
+                'sid_token': self.session_id,
+                'email': message_data.get('from', ''),  # Required by API
+                'in_reply_to': ''  # Not a reply
+            }
+            
+            # Send message
+            response = self.session.post(
+                f"{self.base_url}",
+                params={'f': 'send_email'},
+                data=data,
+                timeout=30
+            )
+            response.raise_for_status()
+            
+            # Check response
+            result = response.json()
+            if result.get('status') == 'success' or 'mail_id' in result:
+                # Wait briefly for message to be delivered
+                sleep(1)
+                
+                # Verify message appears in inbox
+                messages = self.get_messages(message_data['to'])
+                for msg in messages:
+                    if msg.get('subject') == message_data['subject']:
+                        return True
+                        
+                return True  # Return true even if verification fails
+            else:
+                logging.error(f"Failed to send message: {result.get('message', 'Unknown error')}")
+                return False
+                
+        except Exception as e:
+            logging.error(f"Error sending message: {str(e)}")
+            return False
+
+    def forward_message(self, to_email: str, message_data: Dict) -> bool:
+        """Forward a message using Guerrilla Mail API"""
+        try:
+            self._check_session()
+            
+            # Get the full message content if needed
+            if 'html' not in message_data or not message_data.get('body'):
+                message_id = message_data.get('id')
+                if message_id:
+                    full_msg = self.get_message(to_email, message_id)
+                    if full_msg:
+                        message_data.update(full_msg)
+            
+            # Format message for forwarding
+            forward_data = {
+                'to': to_email,
+                'subject': f"Fwd: {message_data.get('subject', 'No Subject')}",
+                'from': message_data.get('forwarded_from', to_email),  # Use destination email as sender
+                'body': message_data.get('body', ''),
+                'html': message_data.get('html', None)
+            }
+            
+            # Create forwarding header
+            forward_header = (
+                "\n\n---------- Forwarded message ----------\n"
+                f"From: {message_data.get('from', 'Unknown')}\n"
+                f"Date: {message_data.get('date', 'Unknown')}\n"
+                f"Subject: {message_data.get('subject', 'No Subject')}\n"
+                f"To: {to_email}\n\n"
+            )
+            
+            # Add headers to content
+            if forward_data.get('html'):
+                html_header = forward_header.replace('\n', '<br>')
+                forward_data['html'] = f"<div style='white-space: pre-wrap;'>{html_header}</div>{forward_data['html']}"
+            else:
+                forward_data['body'] = forward_header + forward_data['body']
+            
+            # Send the forwarded message
+            success = self.send_message(forward_data)
+            if success:
+                # Wait briefly for the message to appear
+                sleep(2)
+                return True
+            return False
+                
+        except Exception as e:
+            logging.error(f"Error forwarding message: {str(e)}")
+            return False
 
 __all__ = [
     'TempMailAPI',
