@@ -57,9 +57,7 @@ git clone https://github.com/Sikandar-irfan/Temp-mail.git
 # Navigate to project directory
 cd Temp-mail
 
-# Run setup script (this will create virtual environment and install dependencies)
-chmod +x setup.sh
-./setup.sh
+
 ```
 
 ## 💻 Usage
