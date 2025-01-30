@@ -100,7 +100,6 @@ def display_goodbye():
         ))
     except Exception:
         pass  # Ignore errors during cleanup
-
 def cleanup(signum=None, frame=None):
     """Cleanup function to handle program exit"""
     try:
@@ -118,6 +117,10 @@ def cleanup(signum=None, frame=None):
         if not hasattr(cleanup, 'goodbye_displayed'):
             display_goodbye()
             cleanup.goodbye_displayed = True
+            
+            # Add a delay before clearing the screen
+            time.sleep(5)
+            clear_screen()
             
     except Exception as e:
         logging.getLogger('temp_mail_cli').error(f"Error during cleanup: {str(e)}")
