@@ -69,6 +69,9 @@ SMTP_PORT=587
 SMTP_USER=your.email@gmail.com    # Your full Gmail address
 SMTP_PASS=xxxx xxxx xxxx xxxx     # Your 16-character App Password
 
+3)save and exit from the editor
+press ctrl+x
+type y & enter
 ```
 
 ## 💻 Usage
