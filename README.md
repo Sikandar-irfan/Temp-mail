@@ -58,6 +58,17 @@ git clone https://github.com/Sikandar-irfan/Temp-mail.git
 cd Temp-mail
 
 
+#SMTP setup for mail forwarding to external source(Skip if Done already)
+
+1)Create .env file(for linux & termux)
+nano .env
+
+2)Paste the below lines with your smtp mail id and password
+SMTP_HOST=smtp.gmail.com
+SMTP_PORT=587
+SMTP_USER=your.email@gmail.com    # Your full Gmail address
+SMTP_PASS=xxxx xxxx xxxx xxxx     # Your 16-character App Password
+
 ```
 
 ## 💻 Usage
