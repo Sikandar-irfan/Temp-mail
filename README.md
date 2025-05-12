@@ -67,7 +67,7 @@ python Temp-mail.py
 
 ## 💻 Usage
 
-When you run the encrypted application, required dependencies will be automatically installed. Just run:
+When you run the application, required dependencies will be automatically installed. Just run:
 
 ```bash
 python Temp-mail.py
@@ -90,7 +90,7 @@ This version of TempMail Manager is distributed as an encrypted Python file to p
 
 ### Email Forwarding
 
-The encrypted version supports the same email forwarding capabilities. To use Gmail forwarding:
+The Application supports the same email forwarding capabilities. To use Gmail forwarding:
 
 1. Enable 2-Step Verification on your Google account
 2. Generate an App Password for the application
